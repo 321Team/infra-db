@@ -82,21 +82,44 @@ annotation_keys={{range $k, $v := .metadata.annotations}}{{$k}} {{end}}
 }
 
 # fds_app 다른 사용처 점검(W0). 값은 출력하지 않고 위치(종류 ns/이름 키)만 출력한다.
-# Secret·ConfigMap 값에 fds_app이 들어 있는 것, 워크로드 spec에 fds_app 리터럴이 있는 것.
+# ① Secret·ConfigMap 값에 fds_app이 들어 있는 것 ② 워크로드 spec에 fds_app 리터럴이 있는 것
+# ③ 워크로드가 이 Secret을 이름으로 참조하는 것(secretKeyRef·envFrom.secretRef·volumes/projected secret).
+# rollout restart는 transaction-api만 대상이므로 ③에 다른 워크로드가 있으면 D 뒤에도 옛 값을 쓴다.
+# 컨트롤러가 소유한 Pod(ownerReferences 있음)는 상위 워크로드로 대신 잡히므로 건너뛴다.
 consumers() {
-  echo "-- fds_app 사용처(값 없음). 기대: Secret $NS/$SECRET $KEY 1줄"
-  { "${K[@]}" get secrets,configmaps -A -o json; echo; "${K[@]}" get deploy,statefulset,daemonset,job,cronjob,pod -A -o json; } \
-    | python3 -I -c '
+  local sj wj
+  sj=$("${K[@]}" get secrets,configmaps -A -o json) || { echo "-- 사용처 점검 실패: Secret·ConfigMap 조회 rc≠0"; return 1; }
+  wj=$("${K[@]}" get deploy,statefulset,daemonset,job,cronjob,pod -A -o json) || { echo "-- 사용처 점검 실패: 워크로드 조회 rc≠0"; return 1; }
+  echo "-- fds_app 사용처(값 없음). 기대: Secret $NS/$SECRET $KEY 1줄 + Deployment $NS/$DEP (Secret 참조) 1줄"
+  printf '%s\n%s\n' "$sj" "$wj" | python3 -I -c '
 import base64, json, sys
+ns_t, sec_t = sys.argv[1], sys.argv[2]
 dec = json.JSONDecoder()
 buf = sys.stdin.read()
-i = 0
+docs, i = [], 0
 while True:
     while i < len(buf) and buf[i].isspace():
         i += 1
     if i >= len(buf):
         break
     doc, i = dec.raw_decode(buf, i)
+    docs.append(doc)
+if len(docs) != 2:
+    sys.exit("조회 결과 문서 수 이상")
+
+def refs(node):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in ("secretKeyRef", "secretRef") and isinstance(v, dict):
+                yield v.get("name")
+            elif k == "secret" and isinstance(v, dict):
+                yield v.get("secretName", v.get("name"))
+            yield from refs(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from refs(v)
+
+for doc in docs:
     for it in doc.get("items", []):
         kind, md = it.get("kind"), it.get("metadata", {})
         where = "%s %s/%s" % (kind, md.get("namespace"), md.get("name"))
@@ -106,9 +129,15 @@ while True:
                     raw = base64.b64decode(v) if (kind == "Secret" and field == "data") or field == "binaryData" else v.encode()
                     if b"fds_app" in raw:
                         print("   " + where + " " + k)
-        elif "fds_app" in json.dumps(it.get("spec", {})):
+            continue
+        if kind == "Pod" and md.get("ownerReferences"):
+            continue
+        spec = it.get("spec", {})
+        if "fds_app" in json.dumps(spec):
             print("   " + where + " (spec 리터럴)")
-'
+        if md.get("namespace") == ns_t and sec_t in set(refs(spec)):
+            print("   " + where + " (Secret 참조)")
+' "$NS" "$SECRET" || { echo "-- 사용처 점검 실패: 분석 rc≠0"; return 1; }
 }
 
 # Secret의 DATABASE_URL 한 키만 파일 내용으로 바꾼다. 값은 argv에 두지 않고 patch 파일(600)로 넘긴다.
@@ -140,7 +169,7 @@ rollout() {
 case "$MODE" in
   check)
     show
-    consumers
+    consumers; echo "-- 사용처 점검 rc=$? (0이어야 판정 가능)"
     python3 --version
     ;;
 

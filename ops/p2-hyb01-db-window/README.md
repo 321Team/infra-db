@@ -21,7 +21,7 @@
 2. 이 PR HEAD의 독립 리뷰(이하영)와 병합. 실행 파일 SHA-256이 병합 commit의 blob과 같음을 실행 기록 첫머리에 남긴다.
 3. 이권욱의 창 서면 GO(시각·실행자·중단/복구 한계 포함). 단톡 사전 공지. 다른 창(#10·#13·#15·#19 시험)과 비중첩.
 4. 사전 확인(W0)에서: Worker 3대 `transaction-api-nodeport` local endpoint, `transaction-api` 3/3 Ready, Deployment 전략이 maxUnavailable 0(3 replica 기본 25%/25%이면 0)인지, 현재 `DATABASE_URL`이 `postgresql+asyncpg://fds_app:***@10.1.93.55:5432/fdsdb` 형식인지(`control01-secret.sh check`의 sanitized URL). 형식이 다르거나 SSL을 끄는 값(`disable`/`allow`)이 있으면 D는 하지 않고 보고한다.
-   - 같은 `check`의 **`fds_app` 사용처 점검**(Secret·ConfigMap 값과 워크로드 spec 리터럴, 값은 출력하지 않고 위치만)이 `Secret fds-app/transaction-api-db-credentials DATABASE_URL` 1줄이어야 한다. 다른 줄이 있으면 D는 하지 않고 보고한다(교체 뒤 그 사용처가 인증 실패하므로).
+   - 같은 `check`의 **`fds_app` 사용처 점검**(Secret·ConfigMap 값, 워크로드 spec 리터럴, 이 Secret을 이름으로 참조하는 워크로드. 값은 출력하지 않고 위치만)이 `Secret fds-app/transaction-api-db-credentials DATABASE_URL` 1줄과 `Deployment fds-app/transaction-api (Secret 참조)` 1줄이고 `사용처 점검 rc=0`이어야 한다. 다른 줄이 있거나 rc≠0이면 D는 하지 않고 보고한다(rollout은 transaction-api만 하므로 다른 사용처는 교체 뒤 옛 값으로 인증 실패한다).
    - 같은 `check`의 `last-applied=`가 `present`이면 그 주석에 현재 값이 들어 있을 수 있다. D의 patch가 같은 요청에서 주석을 지우고 `absent`를 확인한다(`absent`이면 변화 없음). 어느 쪽이든 기록한다.
    - 2026-10-07 18:4x control01 조회(값 가림): `postgresql+asyncpg://fds_app:***@10.1.93.55:5432/fdsdb` — **SSL 파라미터 없음.** asyncpg 기본(prefer)으로 SSL을 협상하고, db01 원격 허용은 `hostssl`뿐이라 평문 연결은 거부된다(앱이 지금 접속 중인 것이 SSL 협상의 근거). D는 비밀번호 부분만 바꾸고 쿼리는 그대로 둔다. `?ssl=require` 명시는 접속 설정 변경이라 이 창에 섞지 않고 후속으로 둔다.
 5. db01 `apply.sh check`의 `RUNTIME_PERMANENT_MATCH=YES`, `db01.sh check`의 pg_hba 오류 0·`.50` 대상 줄 1.
@@ -40,7 +40,7 @@
 
 | 단계 | 상한 | 호스트 | 명령 | 성공 기준 | 실패 시 |
 |---|---|---|---|---|---|
-| W0 사전 | 15분 | 4곳 | `edge01-k3s.sh check`, `db01.sh check`, `apply.sh check`, `control01-secret.sh check` | §2 전제 4·5 충족, `.50` 세션 수·`fds_app` 사용처·`last-applied` 기록, edge01 reload 반영 판정 rc=0·옛 NodePort ESTABLISHED 0 | 시작 안 함 |
+| W0 사전 | 15분 | 4곳 | `edge01-k3s.sh check`, `db01.sh check`, `apply.sh check`, `control01-secret.sh check` | §2 전제 4·5 충족, `.50` 세션 수·`fds_app` 사용처·`last-applied` 기록, db01 로그 끄기 SET 사전 시험 rc=0, edge01 reload 반영 판정 rc=0·옛 NodePort ESTABLISHED 연결 수가 숫자 0(`ERR`이면 `ss` 실패) | 시작 안 함 |
 | W1 E-K3S 중지 | 10분 | edge01 | `edge01-k3s.sh stop` | 사전 게이트(아래) 통과 후 `RESULT k3s-stop=OK`(k3s inactive·shim 0·`.50:30080` 000·nginx `/readyz` 200), db01 `pg_stat_activity` `.50` = 0 | `edge01-k3s.sh rollback` |
 | W2 pg_hba | 5분 | db01 | `db01.sh hba-apply` | `.50` 출발지 세션 0 확인 후 `RESULT hba-apply=OK`(오류 0, `.50` 규칙 0) | `db01.sh hba-rollback` |
 | W3 방화벽 | 20분 | db01 → control01 | `apply.sh apply` → control01 `kubectl -n fds-app rollout restart deploy/transaction-api` + `rollout status` | 새 연결 양성(rollout 완료·3/3 Ready·거래 1건 201), 음성 N1~N3 | `apply.sh rollback` |

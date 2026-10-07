@@ -55,6 +55,8 @@ SET log_min_error_statement = 'panic';
 SET log_min_duration_statement = -1;
 SET log_min_duration_sample = -1;
 SET pg_stat_statements.track_utility = off;"
+# NOLOG_SQL을 값 없이 같은 방식(psql -f -)으로 실행해 본다. 0이면 이 서버에서 SET 5개가 모두 된다.
+nolog_test() { printf '%s\nSELECT 1;\n' "$NOLOG_SQL" | pg -f - >/dev/null; }
 
 show() {
   echo "== $(date '+%F %T %Z') db01 mode=$MODE run=$RUN"
@@ -79,6 +81,7 @@ case "$MODE" in
   check)
     sudo -v || die "sudo 인증 실패"
     show
+    nolog_test; echo "-- 로그 끄기 SET 5개 사전 시험 rc=$? (0이어야 W4 진행)"
     ;;
 
   hba-apply)
@@ -121,6 +124,8 @@ case "$MODE" in
   pw-apply)
     sudo -v || die "sudo 인증 실패"
     show
+    # 검증자 붙여넣기·YES 전에 SET 가능 여부부터 확인한다.
+    nolog_test || die "로그 끄기 SET 사전 시험 실패. DB는 바꾸지 않았다"
     sec_mkdir
     OLDV=$SEC/fds_app.verifier.before
     if sudo -u postgres test -e "$OLDV"; then
@@ -160,6 +165,7 @@ case "$MODE" in
     sudo -u postgres test -f "$OLDV" || die "이전 검증자 사본 없음: $OLDV"
     # 사본이 비거나 깨졌으면 PASSWORD ''(비밀번호 제거)가 될 수 있으므로 형식부터 확인한다.
     test "$(sudo -u postgres grep -cE "$VER_RE" "$OLDV")" = 1 || die "이전 검증자 사본 형식 이상. DB는 바꾸지 않았다"
+    nolog_test || die "로그 끄기 SET 사전 시험 실패. DB는 바꾸지 않았다"
     echo "-- 되돌리기 전 지문: $(fp_live)"
     OLD_FP=$(sudo -u postgres cat "$OLDV" | sha256sum | cut -c1-16)
     sudo -u postgres cat "$OLDV" | { IFS= read -r V; printf "%s\nALTER ROLE fds_app PASSWORD '%s';\n" "$NOLOG_SQL" "$V"; } | pg -f - || die "ALTER ROLE 실패(또는 로그 끄기 SET 실패)"

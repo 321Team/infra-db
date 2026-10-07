@@ -42,7 +42,12 @@ new_refs() {
   echo "$n"
 }
 # 실행 중 nginx가 옛 E-K3S NodePort에 붙어 있는 연결 수(디스크 설정이 아니라 실제 소켓)
-old_estab() { sudo ss -Htn state established '( dst 10.1.93.50:30080 or dst 127.0.0.1:30080 or dst [::1]:30080 )' | wc -l; }
+# ss 자체가 실패하면(옵션·필터 문법·sudo) 0이 아니라 ERR을 내 게이트를 통과하지 못하게 한다.
+old_estab() {
+  local out
+  out=$(sudo ss -Htn state established '( dst 10.1.93.50:30080 or dst 127.0.0.1:30080 or dst [::1]:30080 )') || { echo ERR; return 1; }
+  if test -z "$out"; then echo 0; else printf '%s\n' "$out" | wc -l; fi
+}
 # 디스크 설정이 실행 중 nginx에 반영됐는지: worker 시작 시각(reload 시 새로 뜸)이 nginx -T가 읽은
 # 설정 파일들의 최종 수정 시각 이후인지. 0=반영(OK), 1=설정이 reload 뒤 바뀜, 2=판단 불가
 reloaded_after_conf() {
