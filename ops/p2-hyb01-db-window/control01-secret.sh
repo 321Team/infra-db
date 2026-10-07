@@ -39,17 +39,31 @@ exec > >(tee -a "$LOG") 2>&1
 
 die() { echo "STOP: $*"; exit 3; }
 live_value() { "${K[@]}" -n "$NS" get secret "$SECRET" -o jsonpath="{.data.$KEY}" | base64 -d; }
-fp_live() { live_value | sha256sum | cut -c1-16; }
-fp_file() { sha256sum < "$1" | cut -c1-16; }
-# 값을 출력하지 않고 scheme://user:***@host/db?query 형태로만 보인다.
+# URL 지문: RUN별 무작위 키(secret/fpkey)로 계산한 HMAC-SHA256 앞 16자. 평문 SHA-256이면 로그의 지문으로
+# 이전 비밀번호를 오프라인 추측·확인할 수 있으므로 키를 쓴다. 키는 cleanup에서 지우므로 창 밖에서는 대조할 수 없다.
+FPKEY=$S/fpkey
+case "$MODE" in
+  cleanup) ;;
+  *) test -s "$FPKEY" || head -c 32 /dev/urandom > "$FPKEY" || { echo "STOP: $FPKEY 생성 실패" >&2; exit 2; } ;;
+esac
+hmac16() { python3 -I -c 'import hashlib, hmac, sys; print(hmac.new(open(sys.argv[1], "rb").read(), sys.stdin.buffer.read(), hashlib.sha256).hexdigest()[:16])' "$FPKEY"; }
+fp_live() { live_value | hmac16; }
+fp_file() { hmac16 < "$1"; }
+# 검증자 지문은 db01 pw-apply와 같은 계산(평문 SHA-256 앞 16자). 검증자는 무작위 salt를 포함한다.
+fp_ver() { sha256sum < "$1" | cut -c1-16; }
+# 값을 출력하지 않고 scheme://user:***@host/db?query 형태로만 보인다. 비밀번호에 @가 있어도
+# 마지막 @ 기준으로 나눠 비밀번호 일부가 나오지 않게 한다.
 sanitize() {
   python3 -I -c '
 import sys, re
 s = sys.stdin.read()
-m = re.match(r"^([a-z0-9+]+://)([^:@/]+):[^@]*(@.*)$", s)
+m = re.match(r"^([a-z0-9+]+://)([^:@/]+):.*(@[^@]*)$", s, re.S)
 print(m.group(1) + m.group(2) + ":***" + m.group(3) if m else "(형식 불일치)")
 '
 }
+LA=kubectl.kubernetes.io/last-applied-configuration
+# last-applied-configuration 주석 존재 여부만 출력한다(주석 값에는 Secret data가 들어 있을 수 있음).
+la_state() { "${K[@]}" -n "$NS" get secret "$SECRET" -o go-template='{{range $k, $v := .metadata.annotations}}{{if eq $k "'"$LA"'"}}present{{end}}{{end}}' | grep -q present && echo present || echo absent; }
 
 show() {
   echo "== $(date '+%F %T %Z') control01 mode=$MODE run=$RUN"
@@ -60,14 +74,45 @@ label_keys={{range $k, $v := .metadata.labels}}{{$k}} {{end}}
 annotation_keys={{range $k, $v := .metadata.annotations}}{{$k}} {{end}}
 {{range .metadata.managedFields}}managed: {{.manager}} {{.operation}} {{.time}}
 {{end}}'
-  echo "-- 현재 값 지문=$(fp_live) URL=$(live_value | sanitize)"
+  echo "-- 현재 값 지문(RUN 키 HMAC)=$(fp_live) URL=$(live_value | sanitize) last-applied=$(la_state)"
   echo "-- Deployment $DEP"
   "${K[@]}" -n "$NS" get deploy "$DEP" -o jsonpath='replicas={.spec.replicas} ready={.status.readyReplicas} updated={.status.updatedReplicas} strategy={.spec.strategy}{"\n"}restartedAt={.spec.template.metadata.annotations.kubectl\.kubernetes\.io/restartedAt}{"\n"}'
   "${K[@]}" -n "$NS" get pods -o wide
   "${K[@]}" -n "$NS" get endpointslice -l kubernetes.io/service-name=transaction-api-nodeport -o wide
 }
 
+# fds_app 다른 사용처 점검(W0). 값은 출력하지 않고 위치(종류 ns/이름 키)만 출력한다.
+# Secret·ConfigMap 값에 fds_app이 들어 있는 것, 워크로드 spec에 fds_app 리터럴이 있는 것.
+consumers() {
+  echo "-- fds_app 사용처(값 없음). 기대: Secret $NS/$SECRET $KEY 1줄"
+  { "${K[@]}" get secrets,configmaps -A -o json; echo; "${K[@]}" get deploy,statefulset,daemonset,job,cronjob,pod -A -o json; } \
+    | python3 -I -c '
+import base64, json, sys
+dec = json.JSONDecoder()
+buf = sys.stdin.read()
+i = 0
+while True:
+    while i < len(buf) and buf[i].isspace():
+        i += 1
+    if i >= len(buf):
+        break
+    doc, i = dec.raw_decode(buf, i)
+    for it in doc.get("items", []):
+        kind, md = it.get("kind"), it.get("metadata", {})
+        where = "%s %s/%s" % (kind, md.get("namespace"), md.get("name"))
+        if kind in ("Secret", "ConfigMap"):
+            for field in ("data", "binaryData", "stringData"):
+                for k, v in (it.get(field) or {}).items():
+                    raw = base64.b64decode(v) if (kind == "Secret" and field == "data") or field == "binaryData" else v.encode()
+                    if b"fds_app" in raw:
+                        print("   " + where + " " + k)
+        elif "fds_app" in json.dumps(it.get("spec", {})):
+            print("   " + where + " (spec 리터럴)")
+'
+}
+
 # Secret의 DATABASE_URL 한 키만 파일 내용으로 바꾼다. 값은 argv에 두지 않고 patch 파일(600)로 넘긴다.
+# 같은 patch로 last-applied-configuration 주석을 지운다(있으면 이전 값이 주석에 남으므로. 없으면 변화 없음).
 patch_from() {
   local src=$1 pf=$S/patch.json
   python3 -I - "$src" "$pf" "$KEY" <<'PY' || return 1
@@ -77,12 +122,14 @@ data = open(src, 'rb').read()
 if not data or b'\n' in data:
     sys.exit('값 파일이 비었거나 줄바꿈 포함')
 with open(out, 'w') as f:
-    json.dump({'data': {key: base64.b64encode(data).decode()}}, f)
+    json.dump({'metadata': {'annotations': {'kubectl.kubernetes.io/last-applied-configuration': None}},
+               'data': {key: base64.b64encode(data).decode()}}, f)
 PY
   "${K[@]}" -n "$NS" patch secret "$SECRET" --type merge --patch-file "$pf"
   local rc=$?
   shred -u "$pf"
-  return $rc
+  test "$rc" = 0 || return "$rc"
+  test "$(la_state)" = absent || { echo "patch 후에도 last-applied-configuration 주석이 남음"; return 1; }
 }
 
 rollout() {
@@ -93,6 +140,7 @@ rollout() {
 case "$MODE" in
   check)
     show
+    consumers
     python3 --version
     ;;
 
@@ -156,7 +204,7 @@ for name, val in (('new-url', new), ('verifier', ver)):
     os.close(fd)
 PY
     echo "-- 새 URL=$(sanitize < "$S/new-url") 지문=$(fp_file "$S/new-url")"
-    echo "-- 검증자 지문=$(fp_file "$S/verifier")"
+    echo "-- 검증자 지문=$(fp_ver "$S/verifier")"
     # 검증자는 로그(tee)에 남기지 않고 터미널에만 보낸다.
     { echo; echo "===== db01 pw-apply에 붙여넣을 검증자(한 줄) ====="; cat "$S/verifier"; echo; echo "====="; } > /dev/tty
     echo "RESULT prepare=OK $(date '+%T') 다음: db01 pw-apply → 이 호스트 apply"
@@ -165,7 +213,7 @@ PY
   apply)
     for f in old-url new-url verifier; do test -s "$S/$f" || die "$S/$f 없음(prepare 먼저)"; done
     show
-    read -r -p "db01 pw-apply가 RESULT pw-apply=OK이고 new_fp가 $(fp_file "$S/verifier")이면 YES: " ANS </dev/tty
+    read -r -p "db01 pw-apply가 RESULT pw-apply=OK이고 new_fp가 $(fp_ver "$S/verifier")이면 YES: " ANS </dev/tty
     test "$ANS" = YES || die "확인 안 됨. Secret은 바꾸지 않았다"
     patch_from "$S/new-url" || die "Secret patch 실패 → db01 pw-rollback 판단"
     test "$(fp_live)" = "$(fp_file "$S/new-url")" || die "patch 후 Secret 지문 불일치 → rollback"
@@ -189,7 +237,7 @@ PY
     ;;
 
   cleanup)
-    for f in old-url new-url verifier patch.json; do
+    for f in old-url new-url verifier patch.json fpkey; do
       test -e "$S/$f" && shred -u "$S/$f"
     done
     rmdir "$S" || die "$S가 비지 않음"

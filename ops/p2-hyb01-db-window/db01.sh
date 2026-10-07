@@ -43,8 +43,18 @@ fp_live() { pg -c "SELECT rolpassword FROM pg_authid WHERE rolname = 'fds_app'" 
 fp_str() { printf '%s' "$1" | sha256sum | cut -c1-16; }
 hba_errors() { pg -c "SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL"; }
 hba_has50() { pg -c "SELECT count(*) FROM pg_hba_file_rules WHERE address = '10.1.93.50'"; }
+# .50 출발지 기존 세션 수(계정 무관). reload는 기존 연결을 끊지 않으므로 hba-apply 전에 0이어야 한다.
+sess50() { pg -c "SELECT count(*) FROM pg_stat_activity WHERE client_addr = '10.1.93.50'"; }
 reload() { pg -c "SELECT pg_reload_conf()" >/dev/null || die "pg_reload_conf 실패"; sleep 2; }
 sec_mkdir() { sudo -u postgres mkdir -p -m 700 "$SEC" || die "$SEC 생성 실패"; }
+# ALTER ROLE ... PASSWORD를 서버 로그·통계에 남기지 않도록 같은 psql 세션 앞에 붙인다(postgres superuser만 가능).
+# log_statement(ddl/all), 실패 시 log_min_error_statement, 느린 문장 log_min_duration_*,
+# pg_stat_statements 유틸리티 문장 기록을 이 세션에서만 끈다. 하나라도 실패하면 ON_ERROR_STOP으로 ALTER 전에 멈춘다.
+NOLOG_SQL="SET log_statement = 'none';
+SET log_min_error_statement = 'panic';
+SET log_min_duration_statement = -1;
+SET log_min_duration_sample = -1;
+SET pg_stat_statements.track_utility = off;"
 
 show() {
   echo "== $(date '+%F %T %Z') db01 mode=$MODE run=$RUN"
@@ -60,7 +70,8 @@ show() {
   echo "-- pg_hba_file_rules 오류 수: $(hba_errors)"
   echo "-- fds_app 접속 출발지별 세션 수"
   pg -c "SELECT coalesce(host(client_addr),'local'), count(*) FROM pg_stat_activity WHERE usename = 'fds_app' GROUP BY 1 ORDER BY 1"
-  echo "-- password_encryption=$(pg -c 'SHOW password_encryption') log_statement=$(pg -c 'SHOW log_statement')"
+  echo "-- .50 출발지 세션 수(계정 무관): $(sess50)"
+  echo "-- password_encryption=$(pg -c 'SHOW password_encryption') log_statement=$(pg -c 'SHOW log_statement') log_min_error_statement=$(pg -c 'SHOW log_min_error_statement') log_min_duration_statement=$(pg -c 'SHOW log_min_duration_statement')"
   echo "-- fds_app 검증자 지문: $(fp_live)"
 }
 
@@ -75,6 +86,7 @@ case "$MODE" in
     show
     test "$(sudo grep -cE "$LINE_RE" "$HBA")" = 1 || die ".50 줄이 정확히 1줄이 아님(이미 지웠거나 형식이 다름)"
     test "$(hba_errors)" = 0 || die "적용 전 pg_hba_file_rules 오류가 있음"
+    test "$(sess50)" = 0 || die ".50 출발지 세션이 남아 있음. reload는 기존 연결을 끊지 않는다(W1 E-K3S 중지·세션 종료 확인)"
     sec_mkdir
     sudo -u postgres test -e "$SEC/pg_hba.conf.before" && die "이전 사본이 이미 있음($SEC/pg_hba.conf.before). 같은 RUN으로 재적용하지 않는다"
     sudo -u postgres cp -p "$HBA" "$SEC/pg_hba.conf.before" || die "사본 저장 실패"
@@ -111,11 +123,18 @@ case "$MODE" in
     show
     sec_mkdir
     OLDV=$SEC/fds_app.verifier.before
-    sudo -u postgres test -e "$OLDV" && die "이전 검증자 사본이 이미 있음. 같은 RUN으로 재교체하면 원래 값을 잃는다"
-    # 이전 검증자는 파이프로만 옮긴다(화면·argv에 남기지 않음).
-    pg -c "SELECT rolpassword FROM pg_authid WHERE rolname = 'fds_app'" | tr -d '\n' \
-      | sudo -u postgres sh -c 'umask 077; cat > "$1"' sh "$OLDV" || die "이전 검증자 보관 실패"
-    test "$(sudo -u postgres grep -c '^SCRAM-SHA-256[$]4096:' "$OLDV")" = 1 || die "보관한 이전 검증자 형식 이상"
+    if sudo -u postgres test -e "$OLDV"; then
+      # 같은 RUN 재실행(붙여넣기 형식 오류·지문 불일치로 중단된 뒤). 사본이 현재 DB 검증자와 같을 때만
+      # (= 아직 교체 전) 재사용한다. 다르면 이미 교체된 상태라 재교체하면 원래 값을 잃으므로 멈춘다.
+      test "$(sudo -u postgres cat "$OLDV" | sha256sum | cut -c1-16)" = "$(fp_live)" \
+        || die "이전 검증자 사본이 있고 현재 DB 검증자와 다름(이미 교체됨). 재교체하지 않는다 → 상태 확인 후 pw-rollback 판단"
+      echo "-- 이전 검증자 사본 재사용(현재 DB 검증자와 같음 = 교체 전)"
+    else
+      # 이전 검증자는 파이프로만 옮긴다(화면·argv에 남기지 않음).
+      pg -c "SELECT rolpassword FROM pg_authid WHERE rolname = 'fds_app'" | tr -d '\n' \
+        | sudo -u postgres sh -c 'umask 077; cat > "$1"' sh "$OLDV" || die "이전 검증자 보관 실패"
+    fi
+    test "$(sudo -u postgres grep -cE "$VER_RE" "$OLDV")" = 1 || die "보관한 이전 검증자 형식 이상(DB는 바꾸지 않았다)"
     OLD_FP=$(sudo -u postgres cat "$OLDV" | sha256sum | cut -c1-16)
     echo "-- 이전 검증자 보관: $OLDV (지문 $OLD_FP)"
     read -r -p "control01 prepare가 출력한 검증자 한 줄을 붙여넣고 Enter: " NEWV </dev/tty
@@ -125,7 +144,8 @@ case "$MODE" in
     read -r -p "control01 prepare 출력의 지문과 같으면 YES: " ANS </dev/tty
     test "$ANS" = YES || { unset NEWV; die "지문 확인 안 됨. DB는 바꾸지 않았다"; }
     # printf는 bash 내장이라 검증자가 프로세스 argv에 나타나지 않는다. 기존 세션은 끊기지 않는다.
-    printf "ALTER ROLE fds_app PASSWORD '%s';\n" "$NEWV" | pg -f - || { unset NEWV; die "ALTER ROLE 실패"; }
+    # 같은 세션에서 NOLOG_SQL로 로그·통계 기록을 끈 뒤 ALTER ROLE을 실행한다.
+    printf "%s\nALTER ROLE fds_app PASSWORD '%s';\n" "$NOLOG_SQL" "$NEWV" | pg -f - || { unset NEWV; die "ALTER ROLE 실패(또는 로그 끄기 SET 실패)"; }
     unset NEWV
     LIVE_FP=$(fp_live)
     echo "-- 적용 후 검증자 지문: $LIVE_FP"
@@ -138,9 +158,11 @@ case "$MODE" in
     sudo -v || die "sudo 인증 실패"
     OLDV=$SEC/fds_app.verifier.before
     sudo -u postgres test -f "$OLDV" || die "이전 검증자 사본 없음: $OLDV"
+    # 사본이 비거나 깨졌으면 PASSWORD ''(비밀번호 제거)가 될 수 있으므로 형식부터 확인한다.
+    test "$(sudo -u postgres grep -cE "$VER_RE" "$OLDV")" = 1 || die "이전 검증자 사본 형식 이상. DB는 바꾸지 않았다"
     echo "-- 되돌리기 전 지문: $(fp_live)"
     OLD_FP=$(sudo -u postgres cat "$OLDV" | sha256sum | cut -c1-16)
-    sudo -u postgres cat "$OLDV" | { IFS= read -r V; printf "ALTER ROLE fds_app PASSWORD '%s';\n" "$V"; } | pg -f - || die "ALTER ROLE 실패"
+    sudo -u postgres cat "$OLDV" | { IFS= read -r V; printf "%s\nALTER ROLE fds_app PASSWORD '%s';\n" "$NOLOG_SQL" "$V"; } | pg -f - || die "ALTER ROLE 실패(또는 로그 끄기 SET 실패)"
     LIVE_FP=$(fp_live)
     echo "-- 되돌린 후 지문: $LIVE_FP (기대 $OLD_FP)"
     test "$LIVE_FP" = "$OLD_FP" || die "되돌린 후 지문 불일치"

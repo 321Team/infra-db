@@ -21,6 +21,8 @@
 2. 이 PR HEAD의 독립 리뷰(이하영)와 병합. 실행 파일 SHA-256이 병합 commit의 blob과 같음을 실행 기록 첫머리에 남긴다.
 3. 이권욱의 창 서면 GO(시각·실행자·중단/복구 한계 포함). 단톡 사전 공지. 다른 창(#10·#13·#15·#19 시험)과 비중첩.
 4. 사전 확인(W0)에서: Worker 3대 `transaction-api-nodeport` local endpoint, `transaction-api` 3/3 Ready, Deployment 전략이 maxUnavailable 0(3 replica 기본 25%/25%이면 0)인지, 현재 `DATABASE_URL`이 `postgresql+asyncpg://fds_app:***@10.1.93.55:5432/fdsdb` 형식인지(`control01-secret.sh check`의 sanitized URL). 형식이 다르거나 SSL을 끄는 값(`disable`/`allow`)이 있으면 D는 하지 않고 보고한다.
+   - 같은 `check`의 **`fds_app` 사용처 점검**(Secret·ConfigMap 값과 워크로드 spec 리터럴, 값은 출력하지 않고 위치만)이 `Secret fds-app/transaction-api-db-credentials DATABASE_URL` 1줄이어야 한다. 다른 줄이 있으면 D는 하지 않고 보고한다(교체 뒤 그 사용처가 인증 실패하므로).
+   - 같은 `check`의 `last-applied=`가 `present`이면 그 주석에 현재 값이 들어 있을 수 있다. D의 patch가 같은 요청에서 주석을 지우고 `absent`를 확인한다(`absent`이면 변화 없음). 어느 쪽이든 기록한다.
    - 2026-10-07 18:4x control01 조회(값 가림): `postgresql+asyncpg://fds_app:***@10.1.93.55:5432/fdsdb` — **SSL 파라미터 없음.** asyncpg 기본(prefer)으로 SSL을 협상하고, db01 원격 허용은 `hostssl`뿐이라 평문 연결은 거부된다(앱이 지금 접속 중인 것이 SSL 협상의 근거). D는 비밀번호 부분만 바꾸고 쿼리는 그대로 둔다. `?ssl=require` 명시는 접속 설정 변경이라 이 창에 섞지 않고 후속으로 둔다.
 5. db01 `apply.sh check`의 `RUNTIME_PERMANENT_MATCH=YES`, `db01.sh check`의 pg_hba 오류 0·`.50` 대상 줄 1.
 
@@ -38,9 +40,9 @@
 
 | 단계 | 상한 | 호스트 | 명령 | 성공 기준 | 실패 시 |
 |---|---|---|---|---|---|
-| W0 사전 | 15분 | 4곳 | `edge01-k3s.sh check`, `db01.sh check`, `apply.sh check`, `control01-secret.sh check` | §2 전제 4·5 충족, `.50` 세션 수 기록 | 시작 안 함 |
-| W1 E-K3S 중지 | 10분 | edge01 | `edge01-k3s.sh stop` | `RESULT k3s-stop=OK`(k3s inactive·shim 0·`.50:30080` 000·nginx `/readyz` 200), db01 `pg_stat_activity` `.50` = 0 | `edge01-k3s.sh rollback` |
-| W2 pg_hba | 5분 | db01 | `db01.sh hba-apply` | `RESULT hba-apply=OK`(오류 0, `.50` 규칙 0) | `db01.sh hba-rollback` |
+| W0 사전 | 15분 | 4곳 | `edge01-k3s.sh check`, `db01.sh check`, `apply.sh check`, `control01-secret.sh check` | §2 전제 4·5 충족, `.50` 세션 수·`fds_app` 사용처·`last-applied` 기록, edge01 reload 반영 판정 rc=0·옛 NodePort ESTABLISHED 0 | 시작 안 함 |
+| W1 E-K3S 중지 | 10분 | edge01 | `edge01-k3s.sh stop` | 사전 게이트(아래) 통과 후 `RESULT k3s-stop=OK`(k3s inactive·shim 0·`.50:30080` 000·nginx `/readyz` 200), db01 `pg_stat_activity` `.50` = 0 | `edge01-k3s.sh rollback` |
+| W2 pg_hba | 5분 | db01 | `db01.sh hba-apply` | `.50` 출발지 세션 0 확인 후 `RESULT hba-apply=OK`(오류 0, `.50` 규칙 0) | `db01.sh hba-rollback` |
 | W3 방화벽 | 20분 | db01 → control01 | `apply.sh apply` → control01 `kubectl -n fds-app rollout restart deploy/transaction-api` + `rollout status` | 새 연결 양성(rollout 완료·3/3 Ready·거래 1건 201), 음성 N1~N3 | `apply.sh rollback` |
 | W4 비밀번호 | 20분 | control01 → db01 → control01 | `control01-secret.sh prepare` → `db01.sh pw-apply`(검증자 붙여넣기·지문 YES) → `control01-secret.sh apply` | 지문 일치, `RESULT apply=OK`(rollout 완료), 양성 P1·P2 | db01 `pw-rollback` → control01 `rollback` |
 | W5 종료 확인 | 15분 | 전체 | 양성·음성 재확인, MON, 각 `check` | 아래 표 전부 기대값 | 원인에 맞는 단계부터 역순 복구 |
@@ -48,7 +50,10 @@
 
 - 전체 상한 T0+90분. 상한을 넘기면 진행 중 단계를 되돌리고 멈춘다(한계 연장 없음). 복구 완료 목표 T0+120분.
 - W3에서 현재 비밀번호로 rollout을 한 번 하는 이유: 방화벽·pg_hba 뒤 **새 연결**이 되는지를 비밀번호 교체(W4)와 분리해 확인하기 위함이다. W4가 실패하면 원인을 W4로 좁힐 수 있다.
+- W1 `stop` 사전 게이트(하나라도 아니면 k3s를 멈추지 않음): `nginx -t` 성공, `nginx -T`에서 **주석을 지운 유효 설정** 기준 옛 upstream(`.50`/`127.0.0.1`/`localhost`:30080) 0·Worker 3대 3/3, **실행 중 nginx의 reload 반영**(worker 시작 시각 ≥ `nginx -T`가 읽은 설정 파일들의 최종 수정 시각), nginx 경유 `/readyz` 5회 호출 뒤 옛 NodePort(`.50`/`127.0.0.1`/`[::1]`:30080)로의 **ESTABLISHED 연결 0**, `/readyz` 200. reload 판정이 1(reload 뒤 설정 변경)이나 2(판단 불가)이면 Edge Cutover 기록·설정 diff를 확인한 뒤 다시 판단한다.
+- W2 `hba-apply`는 `.50` 출발지 세션(계정 무관)이 0이 아니면 멈춘다. reload는 기존 연결을 끊지 않으므로 W1에서 E-K3S 연결이 끝났음을 먼저 확인한다.
 - W4 순서: 검증자 → DB 교체 → Secret·rollout. Secret을 먼저 바꾸면 그 사이 재시작되는 Pod가 실패하므로 DB를 먼저 바꾸고 control01 `apply`를 바로 이어 실행한다.
+- W4 `pw-apply` 재실행: 붙여넣기 형식 오류·지문 불일치로 멈춘 뒤 같은 RUN으로 다시 실행하면, 보관한 이전 검증자 사본이 **현재 DB 검증자와 같을 때(= 아직 교체 전)만** 재사용한다. 다르면(이미 교체됨) 멈춘다. 사본은 형식(`SCRAM-SHA-256$4096:…`)을 확인한 뒤에만 쓴다.
 - 복구 순서는 역순(W4 → W3 → W2 → W1). E-K3S를 되살려도 `.50` 규칙(W2·W3)과 이전 비밀번호(W4)를 되돌리지 않으면 E-K3S는 DB에 접속하지 못한다(E-K3S Secret은 이전 값).
 
 ### 확인 시험
@@ -60,7 +65,7 @@
 | N1 | 미승인 출발지 control01 | control01 `timeout 5 bash -c '</dev/tcp/10.1.93.55/5432' ; echo rc=$?` | rc≠0 |
 | N2 | edge01 | edge01 같은 명령 | rc≠0 |
 | N3 | PC(.29) | PC 같은 명령(Git Bash) | rc≠0 |
-| N4 | fds-engine 직접 | control01 `kubectl -n fds-app exec deploy/fds-engine -- python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('10.1.93.55', 5432))"` | 연결 실패(timeout) |
+| N4 | fds-engine 직접 | control01 `kubectl -n fds-app exec deploy/fds-engine -- python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('10.1.93.55', 5432))" ; echo rc=$?` | rc=1이고 오류가 연결 실패(`timed out`·`Connection refused`·`No route to host`). rc=0은 FAIL. rc=126/127(`python3` 없음·실행 불가)이나 exec 자체 실패는 **판정 불가**로 기록하고 다른 방법으로 대체한다 |
 | N5 | pg_hba 대조 | `db01.sh check` | `.50` 규칙 0, `.50` 세션 0 |
 
 시험 거래(`SIM_p2hyb_*`)는 기능 시험 거래로 보존한다(#11 결정안 5887795557).
@@ -69,19 +74,22 @@
 
 - 새 비밀번호는 control01에서 `secrets.token_urlsafe(24)`(32자, URL에 그대로 쓸 수 있는 문자)로 만든다. 현재 `DATABASE_URL`의 비밀번호 부분만 바꾸고 scheme·계정·호스트·DB·쿼리는 그대로 둔다.
 - db01에는 **SCRAM-SHA-256 검증자**(`SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`)만 옮긴다. PostgreSQL은 이 형식을 그대로 저장하므로 평문이 db01·DB 로그·화면 전송 경로에 나타나지 않는다. 검증자로는 로그인할 수 없다(ClientKey가 없음). 계산은 실행마다 RFC 7677 예시로 자체 검사한다.
-- Secret은 `kubectl patch --type merge --patch-file`(파일 600, 직후 shred)로 `DATABASE_URL` 키만 바꾼다. 라벨·주석·다른 키는 유지된다.
+- Secret은 `kubectl patch --type merge --patch-file`(파일 600, 직후 shred)로 `DATABASE_URL` 키만 바꾼다. 라벨·다른 주석·다른 키는 유지된다. 같은 patch에서 `kubectl.kubernetes.io/last-applied-configuration` 주석은 지우고(값이 남을 수 있으므로) patch 뒤 `absent`를 확인한다.
   - `kubectl apply`를 쓰지 않는 이유: client-side apply는 `kubectl.kubernetes.io/last-applied-configuration` 주석에 Secret `data`를 복사해, "값 없는 metadata 조회"에서도 값이 보이게 된다. [infra-kubernetes `scripts/create-secrets-safe.sh`](https://github.com/321Team/infra-kubernetes/blob/main/scripts/create-secrets-safe.sh) `db-url`이 `--dry-run=client -o yaml | kubectl apply -f -`라 이 문제가 있어, 6033064018 §4의 "다음 교체 때 이 스크립트 사용" 대신 이 방식을 쓴다(파일·stdin 전달, xtrace 차단, umask, shred는 같은 원칙). 그 스크립트의 보완은 별도 후속.
-- 반영 확인은 값을 보지 않고 한다: Secret 값의 SHA-256 앞 16자(지문)를 준비 파일과 대조하고, rollout 완료·새 Pod Ready(`/readyz`가 DB ping)·P2 거래 저장으로 확인한다. `kubectl exec -- env`는 쓰지 않는다.
+- 반영 확인은 값을 보지 않고 한다: Secret 값의 지문(RUN별 무작위 키 HMAC-SHA256 앞 16자, §6)을 준비 파일과 대조하고, rollout 완료·새 Pod Ready(`/readyz`가 DB ping)·P2 거래 저장으로 확인한다. `kubectl exec -- env`는 쓰지 않는다.
 
 ## 6. 비밀정보 처리
 
 | 파일 | 위치 | 내용 | 삭제 |
 |---|---|---|---|
 | `old-url`·`new-url`·`verifier` | control01 `/root/p2-hyb01-<RUN>/secret/`(700/600) | 이전·새 `DATABASE_URL`, 검증자 | W6 `cleanup`(shred) |
+| `fpkey` | 같은 control01 폴더 | URL 지문용 RUN 키(32바이트 무작위) | W6 `cleanup`(shred) |
 | `fds_app.verifier.before` | db01 `/var/lib/pgsql/fds-evidence/p2-hyb01-<RUN>/`(postgres 700/600) | 이전 검증자(되돌리기용) | W6 `cleanup`(shred) |
 | `pg_hba.conf.before/after` | 같은 db01 폴더 | pg_hba 사본(비밀 없음) | 유지 |
 
-- 실행 로그(`~/p2-hyb01-<RUN>/*.log`, control01 `/root/p2-hyb01-<RUN>/*.log`)에는 값이 없다: 지문(16자), sanitized URL(`fds_app:***@`), metadata만 남긴다. 검증자는 control01 터미널(`/dev/tty`)에만 출력하고 로그에 남기지 않는다.
+- 실행 로그(`~/p2-hyb01-<RUN>/*.log`, control01 `/root/p2-hyb01-<RUN>/*.log`)에는 값이 없다: 지문(16자), sanitized URL(`fds_app:***@`, 마지막 `@` 기준), metadata만 남긴다. 검증자는 control01 터미널(`/dev/tty`)에만 출력하고 로그에 남기지 않는다.
+- URL 지문은 평문 SHA-256이 아니라 RUN 키(`fpkey`) HMAC이다. 평문 해시면 증적 로그의 지문으로 이전 비밀번호 추측을 오프라인 확인할 수 있기 때문이다. 키는 W6에서 지우므로 창이 끝난 뒤에는 지문으로 값을 확인할 수 없다. 검증자 지문은 db01과 대조해야 하므로 평문 SHA-256 앞 16자를 쓴다(검증자에 무작위 salt가 있어 비밀번호 추측에 쓰이지 않음).
+- **PostgreSQL 서버 로그**: db01 `pw-apply`·`pw-rollback`은 `ALTER ROLE ... PASSWORD`와 같은 psql 세션 앞에서 `log_statement=none`, `log_min_error_statement=panic`, `log_min_duration_statement=-1`, `log_min_duration_sample=-1`, `pg_stat_statements.track_utility=off`를 설정한다(postgres superuser, 그 세션에만 적용). 서버 기본값과 관계없이 검증자 문장이 로그·`pg_stat_statements`에 남지 않게 하기 위함이며, 하나라도 실패하면 `ALTER ROLE` 전에 멈춘다. `check`가 서버의 현재 값(`log_statement`·`log_min_error_statement`·`log_min_duration_statement`)도 기록한다.
 - 세 스크립트 모두 xtrace 상태면 시작하지 않는다(`bash -x` 금지). 새 비밀번호는 Secret 밖에 보관하지 않는다.
 - cleanup은 W5 종료 판정 직후 같은 창에서 한다. 창이 중단돼 되돌리기 가능성이 남으면 cleanup을 미루고 그 사실을 기록한다.
 
