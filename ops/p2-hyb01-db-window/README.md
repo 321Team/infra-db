@@ -40,9 +40,9 @@
 
 | 단계 | 상한 | 호스트 | 명령 | 성공 기준 | 실패 시 |
 |---|---|---|---|---|---|
-| W0 사전 | 15분 | 4곳 | `edge01-k3s.sh check`, `db01.sh check`, `apply.sh check`, `control01-secret.sh check` | §2 전제 4·5 충족, `.50` 세션 수·`fds_app` 사용처·`last-applied` 기록, db01 로그 끄기 SET 사전 시험 rc=0, edge01 reload 반영 판정 rc=0·옛 NodePort ESTABLISHED 연결 수가 숫자 0(`ERR`이면 `ss` 실패) | 시작 안 함 |
+| W0 사전 | 15분 | 4곳 | `edge01-k3s.sh check`, `db01.sh check`, `apply.sh check \| tee ~/p2-hyb01-<RUN>/apply-check-W0.txt`, `control01-secret.sh check`, edge01 `edge01-k3s.sh hba-probe <RUN> allowed`, 음성 시험 N1~N3 **변경 전** 기록 | §2 전제 4·5 충족, db01 `hba_file` 일치=YES, `hba-probe` rc0(ALLOWED — 시험 도구가 이 경로에서 동작함을 먼저 확인), N1~N3 전 결과·도구 존재·출발지 기록, `.50` 세션 수·`fds_app` 사용처·`last-applied` 기록, db01 로그 끄기 SET 사전 시험 rc=0, edge01 reload 반영 판정 rc=0·옛 NodePort ESTABLISHED 연결 수가 숫자 0(`ERR`이면 `ss` 실패) | 시작 안 함 |
 | W1 E-K3S 중지 | 10분 | edge01 | `edge01-k3s.sh stop` | 사전 게이트(아래) 통과 후 `RESULT k3s-stop=OK`(k3s inactive·shim 0·`.50:30080` 000·nginx `/readyz` 200), db01 `pg_stat_activity` `.50` = 0 | `edge01-k3s.sh rollback` |
-| W2 pg_hba | 5분 | db01 | `db01.sh hba-apply` | `.50` 출발지 세션 0 확인 후 `RESULT hba-apply=OK`(오류 0, `.50` 규칙 0) | `db01.sh hba-rollback` |
+| W2 pg_hba | 5분 | db01 → edge01 | `db01.sh hba-apply` → edge01 `edge01-k3s.sh hba-probe <RUN> rejected` (**W3 전**) | `.50` 출발지 세션 0 확인 후 `RESULT hba-apply=OK`(`pg_reload_conf=t`, 파일 오류 0, `.50` 규칙 0, 재적재 로그 기록) **그리고** `hba-probe` rc0(REJECTED: SQLSTATE 28000 `no pg_hba.conf entry`) | `db01.sh hba-rollback` → `hba-probe <RUN> allowed` rc0 |
 | W3 방화벽 | 20분 | db01 → control01 | `apply.sh apply` → control01 `kubectl -n fds-app rollout restart deploy/transaction-api` + `rollout status` | 새 연결 양성(rollout 완료·3/3 Ready·거래 1건 201), 음성 N1~N3 | `apply.sh rollback` |
 | W4 비밀번호 | 20분 | control01 → db01 → control01 | `control01-secret.sh prepare` → `db01.sh pw-apply`(검증자 붙여넣기·지문 YES) → `control01-secret.sh apply` | 지문 일치, `RESULT apply=OK`(rollout 완료), 양성 P1·P2 | db01 `pw-rollback` → control01 `rollback` |
 | W5 종료 확인 | 15분 | 전체 | 양성·음성 재확인, MON, 각 `check` | 아래 표 전부 기대값 | 원인에 맞는 단계부터 역순 복구 |
@@ -52,6 +52,7 @@
 - W3에서 현재 비밀번호로 rollout을 한 번 하는 이유: 방화벽·pg_hba 뒤 **새 연결**이 되는지를 비밀번호 교체(W4)와 분리해 확인하기 위함이다. W4가 실패하면 원인을 W4로 좁힐 수 있다.
 - W1 `stop` 사전 게이트(하나라도 아니면 k3s를 멈추지 않음): `nginx -t` 성공, `nginx -T`에서 **주석을 지운 유효 설정** 기준 옛 upstream(`.50`/`127.0.0.1`/`localhost`:30080) 0·Worker 3대 3/3, **실행 중 nginx의 reload 반영**(정리 중이 아닌 현재 worker의 **보수적 시작 시각 하한** ≥ `nginx -T`가 읽은 설정 파일들의 나노초 최종 수정 시각. 하한 = `지금 − /proc/uptime + starttime ÷ CLK_TCK − 0.011초`, infra-kubernetes#77 병합 `81ad791d`와 같은 방식. `ps lstart`는 초 버림 오차와 ko_KR 요일·월 이름 해석 실패 때문에 쓰지 않는다), nginx 경유 `/readyz` 5회 호출 뒤 옛 NodePort(`.50`/`127.0.0.1`/`[::1]`:30080)로의 **ESTABLISHED 연결 0**, `/readyz` 200. reload 판정이 1(reload 뒤 설정 변경)이나 2(판단 불가)이면 Edge Cutover 기록·설정 diff를 확인한 뒤 다시 판단한다.
 - W2 `hba-apply`는 `.50` 출발지 세션(계정 무관)이 0이 아니면 멈춘다. reload는 기존 연결을 끊지 않으므로 W1에서 E-K3S 연결이 끝났음을 먼저 확인한다.
+- W2 적용 확인(#47 리뷰 B1): `pg_reload_conf()`의 `t`는 신호 전송까지, `pg_hba_file_rules`는 **현재 파일 내용**이라 둘 다 실제 적용 증거가 아니다. 그래서 W3(방화벽)로 `.50`이 TCP에서 막히기 **전에** edge01 `hba-probe`로 새 SSL 접속이 pg_hba 단계에서 거부되는지 본다. 이 도구는 SSL 시작 요청과 StartupMessage만 보내고 서버의 첫 응답으로 판정한다(비밀번호를 보내지 않음, 인증 전 종료). ALLOWED(인증 요청)·REJECTED(28000 `no pg_hba.conf entry`) 외의 응답·연결 실패·timeout은 판정 불가(rc4)이며 PASS로 세지 않는다. 판정 불가면 W3로 넘어가지 않는다.
 - W4 순서: 검증자 → DB 교체 → Secret·rollout. Secret을 먼저 바꾸면 그 사이 재시작되는 Pod가 실패하므로 DB를 먼저 바꾸고 control01 `apply`를 바로 이어 실행한다.
 - W4 `pw-apply` 재실행: 붙여넣기 형식 오류·지문 불일치로 멈춘 뒤 같은 RUN으로 다시 실행하면, 보관한 이전 검증자 사본이 **현재 DB 검증자와 같을 때(= 아직 교체 전)만** 재사용한다. 다르면(이미 교체됨) 멈춘다. 사본은 형식(`SCRAM-SHA-256$4096:…`)을 확인한 뒤에만 쓴다.
 - 복구 순서는 역순(W4 → W3 → W2 → W1). E-K3S를 되살려도 `.50` 규칙(W2·W3)과 이전 비밀번호(W4)를 되돌리지 않으면 E-K3S는 DB에 접속하지 못한다(E-K3S Secret은 이전 값).
@@ -61,12 +62,45 @@
 | 구분 | 시험 | 명령(예) | 기대 |
 |---|---|---|---|
 | P1 | edge 경유 readyz | PC `curl -s -o /dev/null -w '%{http_code}' http://10.1.93.50/readyz` | 200 |
-| P2 | 새 거래 저장 | PC `curl -s -X POST http://10.1.93.50/api/v1/transactions -H 'Content-Type: application/json' -d '{"account_id":"SIM_p2hyb_<yyyymmddHHMM>_1","amount":10000,"transaction_type":"deposit","source_ip":"198.51.100.10"}'` + db01 `SELECT count(*) FROM transactions WHERE account_id LIKE 'SIM_p2hyb_%'` | 201, 행 1 (W3·W4 각 1건) |
-| N1 | 미승인 출발지 control01 | control01 `timeout 5 bash -c '</dev/tcp/10.1.93.55/5432' ; echo rc=$?` | rc≠0 |
-| N2 | edge01 | edge01 같은 명령 | rc≠0 |
-| N3 | PC(.29) | PC 같은 명령(Git Bash) | rc≠0 |
+| P2 | 새 거래 저장(단계별) | 아래 "P2 절차" | 단계마다 curl rc0 **그리고** HTTP 201 **그리고** 응답 `transaction_id`, 그 ID와 계정으로 db01 정확히 1행·금액·유형 일치 |
+| N1 | 미승인 출발지 control01 | 아래 "N1~N3 절차" (W0 변경 전·W3 뒤 각 1회) | 아래 판정표 |
+| N2 | edge01 | 같음 | 같음 |
+| N3 | PC(.29) | 같음(Git Bash) | 같음 |
 | N4 | fds-engine 직접 | control01 `kubectl -n fds-app exec deploy/fds-engine -- python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('10.1.93.55', 5432))" ; echo rc=$?` | rc=1이고 오류가 연결 실패(`timed out`·`Connection refused`·`No route to host`). rc=0은 FAIL. rc=126/127(`python3` 없음·실행 불가)이나 exec 자체 실패는 **판정 불가**로 기록하고 다른 방법으로 대체한다 |
 | N5 | pg_hba 대조 | `db01.sh check` | `.50` 규칙 0, `.50` 세션 0 |
+
+#### P2 절차 (#47 리뷰 B2)
+
+- 계정은 RUN·단계·시도마다 새로 만든다: `SIM_p2hyb_<RUN에서 T 제외>_W3_1`, `…_W4_1`. 재사용하지 않는다. 과거 회차 행이 있어도 판정에 섞이지 않는다.
+- PC(Git Bash), 단계별 응답 파일을 남긴다:
+  ```bash
+  A=SIM_p2hyb_202610081900_W3_1; O=p2-$A.json
+  curl -sS --max-time 10 -o "$O" -w '%{http_code}\n' -X POST http://10.1.93.50/api/v1/transactions -H 'Content-Type: application/json' -d "{\"account_id\":\"$A\",\"amount\":10000,\"transaction_type\":\"deposit\",\"source_ip\":\"198.51.100.10\"}" > "$O.code"; echo "curl_rc=$? http=$(cat "$O.code")"; cat "$O"
+  ```
+- 성공은 `curl_rc=0` **그리고** `http=201` **그리고** 응답에 `transaction_id`가 있을 때만이다. rc≠0·timeout 등 응답이 불확실하면 **바로 다시 보내지 않고** 먼저 그 계정의 저장 여부를 db01에서 조회한다.
+- db01(peer)에서 응답의 ID와 계정으로 정확히 1행을 찾는다(값은 응답·요청에서 옮긴다):
+  ```bash
+  cd /tmp && sudo -u postgres psql -X -d fdsdb -v txid='<응답 transaction_id>' -v acct='SIM_p2hyb_202610081900_W3_1' -c "SELECT account_id, transaction_id, amount, transaction_type, fds_detected, fds_evaluation_skipped FROM transactions WHERE transaction_id = :'txid' AND account_id = :'acct'"
+  ```
+  기대: 1행, 금액 10000·`deposit`, `fds_detected`·`fds_evaluation_skipped`가 응답 값과 같음. W3·W4 두 단계를 합치면 이번 RUN 계정 2행이 정상이다.
+
+#### N1~N3 절차 (#47 리뷰 B3)
+
+출발지마다 같은 명령을 **W0(변경 전)과 W3 뒤** 한 번씩 실행해 stdout·stderr·rc를 남긴다. 도구 존재도 함께 기록한다.
+
+```bash
+command -v timeout bash; S=$(ip -4 route get 10.1.93.55 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p'); echo "src=${S:-?}"; timeout 5 bash -c '</dev/tcp/10.1.93.55/5432'; echo "rc=$?"
+```
+(PC Git Bash는 `ip`가 없으므로 출발지는 `ipconfig`의 `10.1.93.29`로 기록한다.)
+
+| 관측 | 판정 |
+|---|---|
+| rc0(TCP 연결 성공) | 차단 **FAIL** — 중단 기준 |
+| rc125/126/127, `timeout`·`bash` 없음, 권한·실행 오류 | **판정 불가** — 차단으로 세지 않음 |
+| rc124(timeout) 또는 rc1과 `Connection refused`/`No route to host` | 실패 현상만 기록. **변경 전 rc0 → 변경 뒤 실패**로 바뀌었고 db01 규칙(runtime·permanent)과 맞을 때만 이번 통제의 차단 근거로 본다 |
+| 변경 전부터 이미 실패(예: control01 timeout, 원인 미확인) | 보호 증거로 세지 않음(#11 위험수용 5989172773). 원인 확인 전까지 판정 불가로 남기고, edge01·PC의 전후 대조와 Worker 새 연결 양성으로 판단한다 |
+
+필요한 관측이 없으면 판정 불가로 남긴다. 검증을 위해 보안 통제를 풀지 않는다.
 
 시험 거래(`SIM_p2hyb_*`)는 기능 시험 거래로 보존한다(#11 결정안 5887795557).
 

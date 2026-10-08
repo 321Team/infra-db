@@ -5,6 +5,11 @@
 #   stop     : Edge Cutover 완료(nginx가 .50:30080을 더 이상 쓰지 않음)를 확인한 뒤
 #              k3s 중지·자동 시작 해제 → k3s-killall.sh로 남은 컨테이너·NodePort 규칙 정리
 #   rollback : k3s 자동 시작 복구·기동(데이터 /var/lib/rancher/k3s는 지우지 않으므로 그대로 올라온다)
+#   hba-probe <RUN> allowed|rejected
+#            : edge01(.50)에서 db01 5432로 SSL 시작 요청 + fds_app/fdsdb StartupMessage만 보내 서버의 첫 응답으로
+#              pg_hba 판정을 본다(비밀번호를 보내지 않음, 인증 단계 전에 끊음). 인증 요청(R)=허용, SQLSTATE 28000
+#              `no pg_hba.conf entry`=거부, 그 밖(연결 실패·timeout·SSL 거부·다른 오류)=판정 불가.
+#              기대와 같으면 rc0, 반대면 rc3, 판정 불가면 rc4. W0에서 allowed, W2 뒤·W3 전에 rejected를 본다.
 # `systemctl stop k3s`만으로는 컨테이너(containerd-shim)와 kube-proxy iptables 규칙이 남아
 # 옛 백엔드가 계속 db01에 접속할 수 있다. 그래서 k3s-killall.sh까지 실행한다.
 # 출력은 ~/p2-hyb01-<RUN>/에 남는다. set -e는 쓰지 않는다.
@@ -14,7 +19,7 @@ MODE=${1:-}
 RUN=${2:-}
 case "$RUN" in
   [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9]) ;;
-  *) echo "usage: bash $0 check|stop|rollback <RUN=yyyymmddTHHMM>" >&2; exit 2 ;;
+  *) echo "usage: bash $0 check|stop|rollback|hba-probe <RUN=yyyymmddTHHMM> [allowed|rejected]" >&2; exit 2 ;;
 esac
 
 K3S=/usr/local/bin/k3s
@@ -163,6 +168,89 @@ case "$MODE" in
     echo "RESULT k3s-rollback=$(systemctl is-active k3s) $(date '+%T') (Pod 기동은 위 목록으로 판단)"
     ;;
 
+  hba-probe)
+    EXPECT=${3:-}
+    case "$EXPECT" in allowed|rejected) ;; *) die "기대값을 allowed 또는 rejected로 준다" ;; esac
+    echo "== $(date '+%F %T %Z') edge01 hba-probe run=$RUN expect=$EXPECT → 10.1.93.55:5432 user=fds_app db=fdsdb (비밀번호 없음)"
+    python3 - "$EXPECT" <<'PY'
+import socket, ssl, struct, sys
+expect = sys.argv[1]
+host, port = "10.1.93.55", 5432
+
+def out(result, detail):
+    print("HBA_PROBE result=%s expect=%s %s" % (result, expect, detail))
+    if result == "INCONCLUSIVE":
+        sys.exit(4)
+    sys.exit(0 if result.lower() == expect else 3)
+
+try:
+    sock = socket.create_connection((host, port), timeout=5)
+except Exception as e:
+    out("INCONCLUSIVE", "tcp=%s:%s" % (type(e).__name__, e))
+sock.settimeout(5)
+src = sock.getsockname()[0]
+try:
+    sock.sendall(struct.pack(">ii", 8, 80877103))
+    ans = sock.recv(1)
+except Exception as e:
+    out("INCONCLUSIVE", "src=%s sslrequest=%s:%s" % (src, type(e).__name__, e))
+if ans == b"S":
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        sock = ctx.wrap_socket(sock)
+    except Exception as e:
+        out("INCONCLUSIVE", "src=%s tls=%s:%s" % (src, type(e).__name__, e))
+    tls = sock.version()
+else:
+    out("INCONCLUSIVE", "src=%s sslrequest_answer=%r (hostssl 규칙은 SSL 접속에만 해당)" % (src, ans))
+body = struct.pack(">i", 196608)
+for k, v in (("user", "fds_app"), ("database", "fdsdb"), ("application_name", "edge01-hba-probe")):
+    body += k.encode() + b"\0" + v.encode() + b"\0"
+body += b"\0"
+try:
+    sock.sendall(struct.pack(">i", len(body) + 4) + body)
+    head = b""
+    while len(head) < 5:
+        chunk = sock.recv(5 - len(head))
+        if not chunk:
+            break
+        head += chunk
+    if len(head) < 5:
+        out("INCONCLUSIVE", "src=%s tls=%s first_message=EOF" % (src, tls))
+    mtype = head[:1]
+    mlen = struct.unpack(">i", head[1:5])[0]
+    payload = b""
+    while len(payload) < mlen - 4:
+        chunk = sock.recv(mlen - 4 - len(payload))
+        if not chunk:
+            break
+        payload += chunk
+finally:
+    try:
+        sock.close()
+    except Exception:
+        pass
+if mtype == b"R":
+    code = struct.unpack(">i", payload[:4])[0] if len(payload) >= 4 else -1
+    out("ALLOWED", "src=%s tls=%s first_message=R auth_code=%d (인증 요청 = pg_hba 허용 규칙에 걸림)" % (src, tls, code))
+if mtype == b"E":
+    fields = {}
+    for part in payload.split(b"\0"):
+        if part:
+            fields[part[:1].decode()] = part[1:].decode("utf-8", "replace")
+    state, msg = fields.get("C", ""), fields.get("M", "")
+    if state == "28000" and "no pg_hba.conf entry" in msg:
+        out("REJECTED", "src=%s tls=%s sqlstate=%s message=%s" % (src, tls, state, msg))
+    out("INCONCLUSIVE", "src=%s tls=%s sqlstate=%s message=%s" % (src, tls, state, msg))
+out("INCONCLUSIVE", "src=%s tls=%s first_message=%r" % (src, tls, mtype))
+PY
+    PRC=$?
+    echo "RESULT hba-probe=rc$PRC $(date '+%T') (0=기대와 같음, 3=반대, 4=판정 불가)"
+    exit "$PRC"
+    ;;
+
   *)
-    echo "usage: bash $0 check|stop|rollback <RUN>" >&2; exit 2 ;;
+    echo "usage: bash $0 check|stop|rollback|hba-probe <RUN> [allowed|rejected]" >&2; exit 2 ;;
 esac

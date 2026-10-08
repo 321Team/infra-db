@@ -45,7 +45,31 @@ hba_errors() { pg -c "SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT 
 hba_has50() { pg -c "SELECT count(*) FROM pg_hba_file_rules WHERE address = '10.1.93.50'"; }
 # .50 출발지 기존 세션 수(계정 무관). reload는 기존 연결을 끊지 않으므로 hba-apply 전에 0이어야 한다.
 sess50() { pg -c "SELECT count(*) FROM pg_stat_activity WHERE client_addr = '10.1.93.50'"; }
-reload() { pg -c "SELECT pg_reload_conf()" >/dev/null || die "pg_reload_conf 실패"; sleep 2; }
+# pg_reload_conf()는 SQL이 성공해도 신호 전송 결과 t/f를 돌려준다. t일 때만 통과한다(#47 리뷰 B1).
+# t도 신호 전송까지만 뜻한다. 실제 적용은 서버 로그(reload_log)와 edge01 `hba-probe`(새 SSL 접속의 pg_hba 판정)로 확인한다.
+reload() {
+  local sent
+  RELOAD_AT=$(date '+%F %T')
+  sent=$(pg -c "SELECT pg_reload_conf()") || die "pg_reload_conf SQL 실패"
+  test "$sent" = t || die "pg_reload_conf 신호 전송 실패(결과 '$sent')"
+  sleep 2
+  echo "-- pg_reload_conf=t ($RELOAD_AT)"
+}
+# reload 시각 이후 서버 로그의 설정 재적재 줄(기록용). 로그 수집기가 없으면 journald에서 찾는다.
+reload_log() {
+  local f
+  f=$(pg -c "SELECT coalesce(pg_current_logfile(), '')")
+  if test -n "$f"; then
+    case "$f" in /*) ;; *) f=$PGDATA/$f ;; esac
+    echo "-- 서버 로그 $f 의 재적재 관련 최근 줄"
+    sudo tail -n 300 "$f" | grep -E 'SIGHUP|reloading|pg_hba|configuration file' | tail -n 10
+  else
+    echo "-- 서버 로그: pg_current_logfile 없음 → journald(postgresql) $RELOAD_AT 이후"
+    sudo journalctl -u postgresql --since "$RELOAD_AT" --no-pager | grep -E 'SIGHUP|reloading|pg_hba|configuration file' | tail -n 10
+  fi
+}
+# 서버가 실제로 읽는 hba 파일이 이 스크립트가 고치는 파일과 같은지.
+hba_file_ok() { test "$(pg -c 'SHOW hba_file')" = "$HBA"; }
 sec_mkdir() { sudo -u postgres mkdir -p -m 700 "$SEC" || die "$SEC 생성 실패"; }
 # ALTER ROLE ... PASSWORD를 서버 로그·통계에 남기지 않도록 같은 psql 세션 앞에 붙인다(postgres superuser만 가능).
 # log_statement(ddl/all), 실패 시 log_min_error_statement, 느린 문장 log_min_duration_*,
@@ -67,7 +91,8 @@ show() {
   sudo stat -c '%a %U:%G inode=%i size=%s' "$HBA"
   sudo stat -c '%C' "$HBA" 2>/dev/null || true
   echo "-- .50 대상 줄 수(파일): $(sudo grep -cE "$LINE_RE" "$HBA")"
-  echo "-- pg_hba_file_rules (적용 중 규칙)"
+  echo "-- 서버 hba_file=$(pg -c 'SHOW hba_file') (이 스크립트 대상 $HBA, 일치=$(hba_file_ok && echo YES || echo NO))"
+  echo "-- pg_hba_file_rules (현재 파일 내용 — 실제 적용은 reload 로그·edge01 hba-probe로 별도 확인)"
   pg -c "SELECT line_number, type, database, user_name, address, netmask, auth_method, coalesce(error,'') FROM pg_hba_file_rules ORDER BY line_number"
   echo "-- pg_hba_file_rules 오류 수: $(hba_errors)"
   echo "-- fds_app 접속 출발지별 세션 수"
@@ -87,6 +112,7 @@ case "$MODE" in
   hba-apply)
     sudo -v || die "sudo 인증 실패"
     show
+    hba_file_ok || die "서버 hba_file이 $HBA 가 아님. 파일은 바꾸지 않았다"
     test "$(sudo grep -cE "$LINE_RE" "$HBA")" = 1 || die ".50 줄이 정확히 1줄이 아님(이미 지웠거나 형식이 다름)"
     test "$(hba_errors)" = 0 || die "적용 전 pg_hba_file_rules 오류가 있음"
     test "$(sess50)" = 0 || die ".50 출발지 세션이 남아 있음. reload는 기존 연결을 끊지 않는다(W1 E-K3S 중지·세션 종료 확인)"
@@ -104,9 +130,10 @@ case "$MODE" in
     sudo -u postgres sh -c 'cat "$1" > "$2"' sh "$SEC/pg_hba.conf.after" "$HBA" || die "pg_hba.conf 쓰기 실패 → hba-rollback"
     reload
     show
+    reload_log
     test "$(hba_errors)" = 0 || die "reload 후 pg_hba_file_rules 오류 → hba-rollback"
     test "$(hba_has50)" = 0 || die "reload 후에도 .50 규칙이 남음 → 원인 확인"
-    echo "RESULT hba-apply=OK"
+    echo "RESULT hba-apply=OK $(date '+%T') — 파일 변경·reload 신호까지. 실제 적용은 W3 전에 edge01 \`hba-probe $RUN rejected\` rc0으로 확인한다"
     ;;
 
   hba-rollback)
@@ -116,9 +143,10 @@ case "$MODE" in
     sudo -u postgres sh -c 'cat "$1" > "$2"' sh "$SEC/pg_hba.conf.before" "$HBA" || die "pg_hba.conf 복원 실패"
     reload
     show
+    reload_log
     test "$(hba_errors)" = 0 || die "복원 후 pg_hba_file_rules 오류"
     test "$(hba_has50)" = 1 || die "복원 후 .50 규칙 수가 1이 아님"
-    echo "RESULT hba-rollback=OK"
+    echo "RESULT hba-rollback=OK $(date '+%T') — 파일 복원·reload 신호까지. 실제 적용은 edge01 \`hba-probe $RUN allowed\`(방화벽이 열려 있을 때)로 확인한다"
     ;;
 
   pw-apply)
