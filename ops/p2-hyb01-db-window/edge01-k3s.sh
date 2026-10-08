@@ -251,7 +251,11 @@ if mtype == b"E":
             if part:
                 fields[part[:1].decode("ascii", "replace")] = part[1:].decode("utf-8", "replace")
     state, msg = fields.get("C", ""), fields.get("M", "")
-    if state == "28000" and "no pg_hba.conf entry" in msg:
+    # 서버 로케일에 따라 M이 영어 또는 한국어다(db01은 ko — evidence#111 PC 원본, PG16 ko.po). 이번 출발지·계정·DB·SSL의
+    # no-entry 메시지와 정확히 같을 때만 거부로 본다. 다른 28000 원인·다른 출발지/계정/DB·비SSL·다른 언어는 판정 불가(#9 리뷰 B7).
+    expected_en = 'no pg_hba.conf entry for host "%s", user "fds_app", database "fdsdb", SSL encryption' % src
+    expected_ko = '호스트 "%s", 사용자 "fds_app", 데이터베이스 "fdsdb", SSL 암호화 연결에 대한 설정이 pg_hba.conf 파일에 없습니다.' % src
+    if state == "28000" and msg in (expected_en, expected_ko):
         out("REJECTED", "src=%s tls=%s sqlstate=%s message=%s" % (src, tls, state, msg))
     out("INCONCLUSIVE", "src=%s tls=%s sqlstate=%s message=%s payload_len=%d" % (src, tls, state or "?", msg or "?", len(payload)))
 out("INCONCLUSIVE", "src=%s tls=%s first_message=%r" % (src, tls, mtype))

@@ -99,6 +99,7 @@ show() {
   pg -c "SELECT coalesce(host(client_addr),'local'), count(*) FROM pg_stat_activity WHERE usename = 'fds_app' GROUP BY 1 ORDER BY 1"
   echo "-- .50 출발지 세션 수(계정 무관): $(sess50)"
   echo "-- password_encryption=$(pg -c 'SHOW password_encryption') log_statement=$(pg -c 'SHOW log_statement') log_min_error_statement=$(pg -c 'SHOW log_min_error_statement') log_min_duration_statement=$(pg -c 'SHOW log_min_duration_statement')"
+  echo "-- lc_messages=$(pg -c 'SHOW lc_messages') (edge01 hba-probe가 인식하는 거부 메시지 언어: 영어·한국어)"
   echo "-- fds_app 검증자 지문: $(fp_live)"
 }
 
