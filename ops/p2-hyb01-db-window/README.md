@@ -151,7 +151,21 @@ git -C infra-db show <MERGE_SHA>:ops/p2-hyb01-db-window/db01.sh > db01.sh && sha
 - edge01·db01: PC에서 `scp`로 `edge01-k3s.sh`·`db01.sh`·`apply.sh`(`ops/db01-firewall-5432/`) 전달 후 서버 `sha256sum`이 위 값과 같은지 확인.
 - control01: `control01-secret.sh`를 `gzip -9cn | base64 -w 76` 출력에서 옮겨 붙여넣고 복원 후 `sha256sum` 대조.
 
-## 9. 후속 (이 PR 범위 밖)
+## 9. 로컬 회귀시험 (STATIC/MOCK)
+
+저장소 루트에서 Python 3 표준 라이브러리만으로 실행한다(Linux/macOS는 `python3`, Windows는 설치된 Python 3의 `python` 또는 `py -3`).
+
+```bash
+python3 -B -m unittest discover -s ops/p2-hyb01-db-window/tests -p 'test_*.py' -v
+```
+
+`tests/test_hba_probe.py`는 `edge01-k3s.sh`의 실제 Python heredoc을 추출하여 검사한다. 운영 셸 부분은 실행하지 않으며 socket·TLS를 모의 객체로 교체하므로 서버 접속·sudo·DB 변경·비밀번호 전송이 없다. 서버로 전달할 파일은 기존대로 단일 `edge01-k3s.sh`이며 시험 파일은 필요 없다.
+
+- 영어·한국어 no-entry, 실제 socket 출발지·계정·DB·SSL·SQLSTATE 일치, SCRAM 인증 요청을 검사한다.
+- 기대와 반대인 응답은 rc3, 다른 오류·불완전 프레임·비정상 길이·timeout·SSL 거부는 rc4로 멈추는지 확인한다. 분할 수신과 비밀번호 없는 전송도 검사한다.
+- 정상 종료와 `OK`를 MOCK PASS로 기록한다. 실제 TLS 협상·서버 인증서·pg_hba 적용·방화벽·운영 셸 경로를 검증하는 시험이 아니다. W0/W2의 실제 `hba-probe` 원본 출력·rc와 서버 `lc_messages` 기록은 별도로 필요하다.
+
+## 10. 후속 (이 PR 범위 밖)
 
 - `robot$fds-ci`: E-K3S pull secret이 유일한 사용처였다. A 뒤 폐기 여부는 HBR(이하영) 판단.
 - E-K3S uninstall·`/var/lib/rancher/k3s` 삭제: 되돌리기 필요가 없어진 뒤 별도 결정.
