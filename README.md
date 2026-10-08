@@ -1,6 +1,8 @@
 # infra-db
 321Team FDS 프로젝트의 PostgreSQL 외부 VM 구축·설정·운영 형상관리 저장소. P1-DB-01의 설치 자동화, DB·역할·접근제어 설정, 백업·복구 절차 및 검증 자료를 관리한다.
 
+- [P1-DR-01 Backup / Restore Runbook 검토안](docs/P1-DR-01_BACKUP_RESTORE_RUNBOOK.md): 기존 복원 증적, 새 실행의 전제·중단·복구, 비공개 dump 인계 기준.
+
 ## 변경 검토 및 승인 절차
 
 [리뷰·Lead 정책](docs/REVIEW_POLICY.md)은 병합된 중앙 정책을 적용한다. P1-DB-01의 담당과 이권욱의 최종 병합 역할을 유지한다.
