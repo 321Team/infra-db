@@ -48,21 +48,50 @@ old_estab() {
   out=$(sudo ss -Htn state established '( dst 10.1.93.50:30080 or dst 127.0.0.1:30080 or dst [::1]:30080 )') || { echo ERR; return 1; }
   if test -z "$out"; then echo 0; else printf '%s\n' "$out" | wc -l; fi
 }
-# 디스크 설정이 실행 중 nginx에 반영됐는지: worker 시작 시각(reload 시 새로 뜸)이 nginx -T가 읽은
-# 설정 파일들의 최종 수정 시각 이후인지. 0=반영(OK), 1=설정이 reload 뒤 바뀜, 2=판단 불가
+# worker 시작 시각 원천. 시험에서 바꿔 끼울 수 있게 /proc 읽기만 따로 둔다.
+proc_stat() { cat "/proc/$1/stat"; }
+proc_uptime() { cat /proc/uptime; }
+# 디스크 설정이 실행 중 nginx에 반영됐는지: 현재 worker(reload 시 새로 뜸)가 nginx -T가 읽은 설정 파일들의
+# 최종 수정 시각 이후에 시작됐는지. 정리 중인 옛 worker("shutting down")는 뺀다. 0=반영(OK), 1=설정이 reload 뒤
+# 바뀜(또는 오차 범위 안이라 확정 못 함), 2=판단 불가.
+# infra-kubernetes#77(병합 81ad791d)과 같은 방식이다. ps lstart는 쓰지 않는다: 부팅 시각(btime, 초 버림)+경과라
+# 최대 1초 이르게 나오고, 이 호스트(ko_KR)에서는 요일·월 이름 때문에 date -d가 해석하지 못해 늘 2가 된다
+# (Edge Cutover RUN 20261008T1730에서 같은 판정이 거짓 UNCONFIRMED). 설정은 나노초 mtime, worker는 아래
+# worker_start의 보수적 시작 시각 하한과 비교한다.
 reloaded_after_conf() {
-  local master newest wstart pid t
+  local master newest wstart pid t args n_old=0 n_cur=0
   master=$(pgrep -o -x nginx) || return 2
-  newest=$(sudo nginx -T 2>/dev/null | sed -n 's/^# configuration file \(.*\):$/\1/p' | while IFS= read -r f; do sudo stat -c %Y "$f"; done | sort -n | tail -1)
+  newest=$(sudo nginx -T 2>/dev/null | sed -n 's/^# configuration file \(.*\):$/\1/p' | while IFS= read -r f; do sudo date -r "$f" +%s.%N; done | sort -n | tail -1)
   wstart=
   for pid in $(pgrep -P "$master" -x nginx); do
-    t=$(date -d "$(ps -o lstart= -p "$pid")" +%s) || return 2
-    if test -z "$wstart" || test "$t" -lt "$wstart"; then wstart=$t; fi
+    args=$(ps -o args= -p "$pid") || return 2
+    case "$args" in *"shutting down"*) n_old=$((n_old + 1)); continue ;; esac
+    case "$args" in *"worker process"*) ;; *) continue ;; esac
+    t=$(worker_start "$pid") || return 2
+    n_cur=$((n_cur + 1))
+    if test -z "$wstart" || earlier "$t" "$wstart"; then wstart=$t; fi
   done
   test -n "$newest" && test -n "$wstart" || return 2
-  echo "   nginx 설정 최종 수정=$(date -d "@$newest" '+%F %T') worker 최초 시작=$(date -d "@$wstart" '+%F %T')"
-  test "$wstart" -ge "$newest" || return 1
+  echo "   nginx 설정 최종 수정=$(date -d "@${newest%.*}" '+%F %T').${newest#*.} 현재 worker ${n_cur}개 최초 시작(하한)=$(date -d "@${wstart%.*}" '+%F %T').${wstart#*.} 정리 중 옛 worker=${n_old}"
+  earlier "$wstart" "$newest" && return 1
   return 0
+}
+# $1 < $2 (소수 초)면 0
+earlier() { awk -v a="$1" -v b="$2" 'BEGIN { if (a + 0 < b + 0) exit 0; exit 1 }'; }
+# worker 시작 시각의 보수적 하한(epoch, 소수 6자리). 실제 시작은 이 값보다 늦다.
+# 전제: 측정 동안 벽시계와 부팅 기준 시계의 차이가 일정하다(시계 step이 없음).
+#   실제 시작 = 부팅 시각 B + starttime 실제값, starttime 실제값 ≥ s/h (/proc/<pid>/stat 22번째, tick 버림)
+#   지금 n을 먼저 읽고 uptime을 나중에 읽으므로, n을 읽은 순간의 실제 uptime U1 ≤ 뒤에 읽은 uptime U2 < u + 0.01
+#   (/proc/uptime은 소수 둘째 자리 아래를 버린다) → B = n − U1 > n − u − 0.01
+#   → 실제 시작 > n − u + s/h − 0.010. 출력 반올림(%.6f, 0.5µs)까지 덮도록 1ms를 더 빼 0.011을 뺀다.
+worker_start() {
+  local now up st hz
+  hz=$(getconf CLK_TCK) || return 1
+  now=$(date +%s.%N) || return 1
+  up=$(proc_uptime | awk '{ print $1 }') || return 1
+  st=$(proc_stat "$1" | sed 's/^.*) //' | awk '{ print $20 }') || return 1
+  awk -v n="$now" -v u="$up" -v s="$st" -v h="$hz" \
+    'BEGIN { if (s ~ /^[0-9]+$/ && u ~ /^[0-9.]+$/ && h ~ /^[0-9]+$/ && h > 0) { printf "%.6f\n", n - u + s / h - 0.011; exit 0 } exit 1 }'
 }
 shim_count() { pgrep -fc 'containerd-shim' || true; }
 

@@ -21,7 +21,7 @@
 2. 이 PR HEAD의 독립 리뷰(이하영)와 병합. 실행 파일 SHA-256이 병합 commit의 blob과 같음을 실행 기록 첫머리에 남긴다.
 3. 이권욱의 창 서면 GO(시각·실행자·중단/복구 한계 포함). 단톡 사전 공지. 다른 창(#10·#13·#15·#19 시험)과 비중첩.
 4. 사전 확인(W0)에서: Worker 3대 `transaction-api-nodeport` local endpoint, `transaction-api` 3/3 Ready, Deployment 전략이 maxUnavailable 0(3 replica 기본 25%/25%이면 0)인지, 현재 `DATABASE_URL`이 `postgresql+asyncpg://fds_app:***@10.1.93.55:5432/fdsdb` 형식인지(`control01-secret.sh check`의 sanitized URL). 형식이 다르거나 SSL을 끄는 값(`disable`/`allow`)이 있으면 D는 하지 않고 보고한다.
-   - 같은 `check`의 **`fds_app` 사용처 점검**(Secret·ConfigMap 값, 워크로드 spec 리터럴, 이 Secret을 이름으로 참조하는 워크로드. 값은 출력하지 않고 위치만)이 `Secret fds-app/transaction-api-db-credentials DATABASE_URL` 1줄과 `Deployment fds-app/transaction-api (Secret 참조)` 1줄이고 `사용처 점검 rc=0`이어야 한다. 다른 줄이 있거나 rc≠0이면 D는 하지 않고 보고한다(rollout은 transaction-api만 하므로 다른 사용처는 교체 뒤 옛 값으로 인증 실패한다).
+   - 같은 `check`의 **`fds_app` 사용처 점검**(Secret·ConfigMap 값, 워크로드 spec 리터럴, 이 Secret을 이름으로 참조하는 워크로드. 값은 출력하지 않고 위치만)이 `Secret fds-app/transaction-api-db-credentials DATABASE_URL` 1줄과 `Deployment fds-app/transaction-api (Secret 참조)` 1줄이고 `사용처 점검 rc=0`이어야 한다. 다른 줄이 있거나 rc≠0이면 D는 하지 않고 보고한다(rollout은 transaction-api만 하므로 다른 사용처는 교체 뒤 옛 값으로 인증 실패한다). CronJob이 만든 Job도 별도 줄로 나오므로(Pod만 ownerReferences로 제외) 이런 줄도 "다른 줄"로 보고 D를 하지 않는다(이하영 재리뷰 비차단 메모).
    - 같은 `check`의 `last-applied=`가 `present`이면 그 주석에 현재 값이 들어 있을 수 있다. D의 patch가 같은 요청에서 주석을 지우고 `absent`를 확인한다(`absent`이면 변화 없음). 어느 쪽이든 기록한다.
    - 2026-10-07 18:4x control01 조회(값 가림): `postgresql+asyncpg://fds_app:***@10.1.93.55:5432/fdsdb` — **SSL 파라미터 없음.** asyncpg 기본(prefer)으로 SSL을 협상하고, db01 원격 허용은 `hostssl`뿐이라 평문 연결은 거부된다(앱이 지금 접속 중인 것이 SSL 협상의 근거). D는 비밀번호 부분만 바꾸고 쿼리는 그대로 둔다. `?ssl=require` 명시는 접속 설정 변경이라 이 창에 섞지 않고 후속으로 둔다.
 5. db01 `apply.sh check`의 `RUNTIME_PERMANENT_MATCH=YES`, `db01.sh check`의 pg_hba 오류 0·`.50` 대상 줄 1.
@@ -50,7 +50,7 @@
 
 - 전체 상한 T0+90분. 상한을 넘기면 진행 중 단계를 되돌리고 멈춘다(한계 연장 없음). 복구 완료 목표 T0+120분.
 - W3에서 현재 비밀번호로 rollout을 한 번 하는 이유: 방화벽·pg_hba 뒤 **새 연결**이 되는지를 비밀번호 교체(W4)와 분리해 확인하기 위함이다. W4가 실패하면 원인을 W4로 좁힐 수 있다.
-- W1 `stop` 사전 게이트(하나라도 아니면 k3s를 멈추지 않음): `nginx -t` 성공, `nginx -T`에서 **주석을 지운 유효 설정** 기준 옛 upstream(`.50`/`127.0.0.1`/`localhost`:30080) 0·Worker 3대 3/3, **실행 중 nginx의 reload 반영**(worker 시작 시각 ≥ `nginx -T`가 읽은 설정 파일들의 최종 수정 시각), nginx 경유 `/readyz` 5회 호출 뒤 옛 NodePort(`.50`/`127.0.0.1`/`[::1]`:30080)로의 **ESTABLISHED 연결 0**, `/readyz` 200. reload 판정이 1(reload 뒤 설정 변경)이나 2(판단 불가)이면 Edge Cutover 기록·설정 diff를 확인한 뒤 다시 판단한다.
+- W1 `stop` 사전 게이트(하나라도 아니면 k3s를 멈추지 않음): `nginx -t` 성공, `nginx -T`에서 **주석을 지운 유효 설정** 기준 옛 upstream(`.50`/`127.0.0.1`/`localhost`:30080) 0·Worker 3대 3/3, **실행 중 nginx의 reload 반영**(정리 중이 아닌 현재 worker의 **보수적 시작 시각 하한** ≥ `nginx -T`가 읽은 설정 파일들의 나노초 최종 수정 시각. 하한 = `지금 − /proc/uptime + starttime ÷ CLK_TCK − 0.011초`, infra-kubernetes#77 병합 `81ad791d`와 같은 방식. `ps lstart`는 초 버림 오차와 ko_KR 요일·월 이름 해석 실패 때문에 쓰지 않는다), nginx 경유 `/readyz` 5회 호출 뒤 옛 NodePort(`.50`/`127.0.0.1`/`[::1]`:30080)로의 **ESTABLISHED 연결 0**, `/readyz` 200. reload 판정이 1(reload 뒤 설정 변경)이나 2(판단 불가)이면 Edge Cutover 기록·설정 diff를 확인한 뒤 다시 판단한다.
 - W2 `hba-apply`는 `.50` 출발지 세션(계정 무관)이 0이 아니면 멈춘다. reload는 기존 연결을 끊지 않으므로 W1에서 E-K3S 연결이 끝났음을 먼저 확인한다.
 - W4 순서: 검증자 → DB 교체 → Secret·rollout. Secret을 먼저 바꾸면 그 사이 재시작되는 Pod가 실패하므로 DB를 먼저 바꾸고 control01 `apply`를 바로 이어 실행한다.
 - W4 `pw-apply` 재실행: 붙여넣기 형식 오류·지문 불일치로 멈춘 뒤 같은 RUN으로 다시 실행하면, 보관한 이전 검증자 사본이 **현재 DB 검증자와 같을 때(= 아직 교체 전)만** 재사용한다. 다르면(이미 교체됨) 멈춘다. 사본은 형식(`SCRAM-SHA-256$4096:…`)을 확인한 뒤에만 쓴다.
