@@ -52,6 +52,7 @@
 - W3에서 현재 비밀번호로 rollout을 한 번 하는 이유: 방화벽·pg_hba 뒤 **새 연결**이 되는지를 비밀번호 교체(W4)와 분리해 확인하기 위함이다. W4가 실패하면 원인을 W4로 좁힐 수 있다.
 - W1 `stop` 사전 게이트(하나라도 아니면 k3s를 멈추지 않음): `nginx -t` 성공, `nginx -T`에서 **주석을 지운 유효 설정** 기준 옛 upstream(`.50`/`127.0.0.1`/`localhost`:30080) 0·Worker 3대 3/3, **실행 중 nginx의 reload 반영**(정리 중이 아닌 현재 worker의 **보수적 시작 시각 하한** ≥ `nginx -T`가 읽은 설정 파일들의 나노초 최종 수정 시각. 하한 = `지금 − /proc/uptime + starttime ÷ CLK_TCK − 0.011초`, infra-kubernetes#77 병합 `81ad791d`와 같은 방식. `ps lstart`는 초 버림 오차와 ko_KR 요일·월 이름 해석 실패 때문에 쓰지 않는다), nginx 경유 `/readyz` 5회 호출 뒤 옛 NodePort(`.50`/`127.0.0.1`/`[::1]`:30080)로의 **ESTABLISHED 연결 0**, `/readyz` 200. reload 판정이 1(reload 뒤 설정 변경)이나 2(판단 불가)이면 Edge Cutover 기록·설정 diff를 확인한 뒤 다시 판단한다.
 - W2 `hba-apply`는 `.50` 출발지 세션(계정 무관)이 0이 아니면 멈춘다. reload는 기존 연결을 끊지 않으므로 W1에서 E-K3S 연결이 끝났음을 먼저 확인한다.
+- W3 선행조건(#9 리뷰 이하영 비차단 2): db01 콘솔 접속이 열려 있고 `apply.sh rollback`을 바로 실행할 수 있어야 한다. `apply`가 reload 뒤 exit 4(인터페이스 바인딩 변경)로 멈추면 permanent 변경은 이미 적용된 상태이므로 즉시 `rollback`을 판단한다.
 - W2 적용 확인(#47 리뷰 B1): `pg_reload_conf()`의 `t`는 신호 전송까지, `pg_hba_file_rules`는 **현재 파일 내용**이라 둘 다 실제 적용 증거가 아니다. 그래서 W3(방화벽)로 `.50`이 TCP에서 막히기 **전에** edge01 `hba-probe`로 새 SSL 접속이 pg_hba 단계에서 거부되는지 본다. 이 도구는 SSL 시작 요청과 StartupMessage만 보내고 서버의 첫 응답으로 판정한다(비밀번호를 보내지 않음, 인증 전 종료). ALLOWED(인증 요청)·REJECTED(28000 `no pg_hba.conf entry`) 외의 응답·연결 실패·timeout은 판정 불가(rc4)이며 PASS로 세지 않는다. 판정 불가면 W3로 넘어가지 않는다.
 - W4 순서: 검증자 → DB 교체 → Secret·rollout. Secret을 먼저 바꾸면 그 사이 재시작되는 Pod가 실패하므로 DB를 먼저 바꾸고 control01 `apply`를 바로 이어 실행한다.
 - W4 `pw-apply` 재실행: 붙여넣기 형식 오류·지문 불일치로 멈춘 뒤 같은 RUN으로 다시 실행하면, 보관한 이전 검증자 사본이 **현재 DB 검증자와 같을 때(= 아직 교체 전)만** 재사용한다. 다르면(이미 교체됨) 멈춘다. 사본은 형식(`SCRAM-SHA-256$4096:…`)을 확인한 뒤에만 쓴다.
@@ -78,10 +79,16 @@
   curl -sS --max-time 10 -o "$O" -w '%{http_code}\n' -X POST http://10.1.93.50/api/v1/transactions -H 'Content-Type: application/json' -d "{\"account_id\":\"$A\",\"amount\":10000,\"transaction_type\":\"deposit\",\"source_ip\":\"198.51.100.10\"}" > "$O.code"; echo "curl_rc=$? http=$(cat "$O.code")"; cat "$O"
   ```
 - 성공은 `curl_rc=0` **그리고** `http=201` **그리고** 응답에 `transaction_id`가 있을 때만이다. rc≠0·timeout 등 응답이 불확실하면 **바로 다시 보내지 않고** 먼저 그 계정의 저장 여부를 db01에서 조회한다.
-- db01(peer)에서 응답의 ID와 계정으로 정확히 1행을 찾는다(값은 응답·요청에서 옮긴다):
+- db01(peer)에서 응답의 ID와 계정으로 정확히 1행을 찾는다. `psql -c`로 넘긴 SQL에는 psql 변수(`:'txid'`)가 치환되지 않으므로 **표준 입력(인용 heredoc)으로** 넣는다(#9 리뷰 B4). 값은 응답·요청에서 옮긴다:
   ```bash
-  cd /tmp && sudo -u postgres psql -X -d fdsdb -v txid='<응답 transaction_id>' -v acct='SIM_p2hyb_202610081900_W3_1' -c "SELECT account_id, transaction_id, amount, transaction_type, fds_detected, fds_evaluation_skipped FROM transactions WHERE transaction_id = :'txid' AND account_id = :'acct'"
+  cd /tmp && sudo -u postgres psql -X -A -d fdsdb -v ON_ERROR_STOP=1 -v txid='<응답 transaction_id>' -v acct='SIM_p2hyb_202610081900_W3_1' <<'SQL'
+  SELECT account_id, transaction_id, amount, transaction_type, fds_detected, fds_evaluation_skipped
+  FROM transactions
+  WHERE transaction_id = :'txid' AND account_id = :'acct';
+  SQL
+  echo "P2_DB_QUERY_RC=$?"
   ```
+  `P2_DB_QUERY_RC=0`은 조회가 실행됐다는 뜻일 뿐이다. 출력 끝의 `(1 row)`와 값으로 판정한다. 0행·값 불일치·rc≠0이면 W4나 완료 판정으로 넘어가지 않는다.
   기대: 1행, 금액 10000·`deposit`, `fds_detected`·`fds_evaluation_skipped`가 응답 값과 같음. W3·W4 두 단계를 합치면 이번 RUN 계정 2행이 정상이다.
 
 #### N1~N3 절차 (#47 리뷰 B3)

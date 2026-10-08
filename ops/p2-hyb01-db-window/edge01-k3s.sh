@@ -227,6 +227,9 @@ try:
         if not chunk:
             break
         payload += chunk
+except Exception as e:
+    # TLS 뒤 응답 대기 timeout·연결 끊김 등은 판정 불가(rc4). 처리하지 않으면 traceback rc1로 끝난다(#9 리뷰 이하영 비차단 1).
+    out("INCONCLUSIVE", "src=%s tls=%s startup=%s:%s" % (src, tls, type(e).__name__, e))
 finally:
     try:
         sock.close()
