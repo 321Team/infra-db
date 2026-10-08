@@ -28,15 +28,23 @@ show() {
 # interfaces 줄은 비교에서 뺀다: NetworkManager가 zone에 붙인 인터페이스(connection.zone)는 runtime에만 보이고
 # permanent zone 파일에는 없다(2026-10-08 db01: runtime `ens160 ens192` / permanent 빈 값). 이 바인딩은 --reload 뒤에도
 # 유지되지만, 유지되는지는 apply에서 reload 전후 인터페이스 목록으로 다시 확인한다(rt_ifaces).
+# rich rule 줄은 순서를 무시하고 집합으로 비교한다. firewalld의 runtime 목록 순서는 추가 순서와 다를 수 있다(2026-10-08
+# RUN 20261008T1930 W5: apply 뒤 같은 규칙 6개가 runtime·permanent에서 순서만 달라 MATCH=NO, 정렬 비교는 같음).
 # 0=같음, 1=다름(diff 출력), 2=조회 실패·빈 출력(판정 불가). process substitution 안의 조회 실패는 diff rc로 전달되지
 # 않아 빈 출력끼리 "같음"이 될 수 있으므로, 조회를 먼저 변수로 받아 rc와 비어 있지 않음을 확인한다(#9 리뷰 B5).
+# 첫 줄(zone 이름, runtime에만 "(active)")과 interfaces 줄을 빼고, rule 줄은 앞 공백을 떼어 정렬한 뒤 끝에 붙인다.
+norm_zone() {
+  local body
+  body=$(printf '%s\n' "$1" | sed '1d; /^[[:space:]]*interfaces:/d')
+  printf '%s\n' "$body" | sed '/^[[:space:]]*rule /d'
+  printf '%s\n' "$body" | sed -n 's/^[[:space:]]*\(rule .*\)$/\1/p' | LC_ALL=C sort
+}
 same_rt_perm() {
   local rt perm
   rt=$(sudo firewall-cmd --zone="$ZONE" --list-all) || { echo "STOP: runtime 조회 실패" >&2; return 2; }
   perm=$(sudo firewall-cmd --permanent --zone="$ZONE" --list-all) || { echo "STOP: permanent 조회 실패" >&2; return 2; }
   test -n "$rt" && test -n "$perm" || { echo "STOP: 방화벽 조회 출력이 비어 있음" >&2; return 2; }
-  # 첫 줄(zone 이름, runtime에만 "(active)")과 interfaces 줄은 비교에서 뺀다.
-  diff <(printf '%s\n' "$rt" | sed '1d; /^[[:space:]]*interfaces:/d') <(printf '%s\n' "$perm" | sed '1d; /^[[:space:]]*interfaces:/d')
+  diff <(norm_zone "$rt") <(norm_zone "$perm")
 }
 rt_ifaces() {
   local out
@@ -56,7 +64,7 @@ case "$MODE" in
     show
     CMP=0; same_rt_perm >/dev/null || CMP=$?
     case "$CMP" in
-      0) echo "RUNTIME_PERMANENT_MATCH=YES (interfaces 줄 제외)" ;;
+      0) echo "RUNTIME_PERMANENT_MATCH=YES (interfaces 줄 제외, rich rule 순서 무시)" ;;
       1) echo "RUNTIME_PERMANENT_MATCH=NO"; same_rt_perm || true ;;
       *) echo "RUNTIME_PERMANENT_MATCH=QUERY_ERROR (판정 불가)" ;;
     esac
