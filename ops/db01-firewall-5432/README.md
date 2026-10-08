@@ -28,7 +28,7 @@
 1. 이 PR의 HEAD를 작성자 외 적격 검토자가 독립 리뷰한다(실행 설정 변경).
 2. 적용 SHA를 고정하고, 리뷰 SHA와의 일치를 실행 기록에 남긴다.
 3. `pg_hba` 허용 주소가 위 표(+ 아래 후속 항목의 `.50`)와 여전히 같은지 적용 직전 `check`로 확인한다.
-4. `check` 출력의 `RUNTIME_PERMANENT_MATCH=YES`를 확인한다. `--reload`는 runtime 전용 규칙을 지우므로, `NO`이면 차이를 먼저 해소한다(`apply`도 이 경우 변경 없이 중단한다). 비교에서 `interfaces:` 줄은 뺀다. NetworkManager가 zone에 붙인 인터페이스는 runtime에만 보이고 permanent zone 파일에는 없으며(2026-10-08 db01 `check`: runtime `ens160 ens192` / permanent 빈 값), `--reload` 뒤에도 유지된다. `apply`·`rollback`은 reload 전후 runtime 인터페이스 목록이 같은지 다시 보고, 다르면 exit 4로 멈춘다.
+4. `check` 출력의 `RUNTIME_PERMANENT_MATCH=YES`를 확인한다. `--reload`는 runtime 전용 규칙을 지우므로, `NO`이면 차이를 먼저 해소한다(`apply`도 이 경우 변경 없이 중단한다). 비교에서 `interfaces:` 줄은 뺀다. NetworkManager가 zone에 붙인 인터페이스는 runtime에만 보이고 permanent zone 파일에는 없으며(2026-10-08 db01 `check`: runtime `ens160 ens192` / permanent 빈 값), `--reload` 뒤에도 유지된다. rich rule은 순서를 무시하고 집합으로 비교한다. runtime 목록 순서는 추가 순서와 다를 수 있다(2026-10-08 RUN 20261008T1930 W5: 같은 규칙 6개가 순서만 달라 `NO`가 나옴, 정렬 비교는 같음). `apply`·`rollback`은 reload 전후 runtime 인터페이스 목록이 같은지 다시 보고, 다르면 exit 4로 멈춘다.
 5. edge01 뒤의 옛 E-K3S 백엔드가 아직 응답 중이면(9/25 #23 기록) `.50` 차단 후 그 백엔드의 DB 저장이 실패한다. **k3s 정리(중지)와 같은 변경 창에서 적용한다.**
 
 ## 절차 (db01, 기존 콘솔 계정)
