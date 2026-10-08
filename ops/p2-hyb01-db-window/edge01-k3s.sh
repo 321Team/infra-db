@@ -209,26 +209,26 @@ body = struct.pack(">i", 196608)
 for k, v in (("user", "fds_app"), ("database", "fdsdb"), ("application_name", "edge01-hba-probe")):
     body += k.encode() + b"\0" + v.encode() + b"\0"
 body += b"\0"
+
+def read_exact(n):
+    data = bytearray()
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise EOFError("incomplete PostgreSQL message (%d/%d bytes)" % (len(data), n))
+        data.extend(chunk)
+    return bytes(data)
+
+# 첫 응답 프레임을 선언 길이만큼 정확히 받는다. 중간 EOF·timeout·비정상 길이는 판정 불가(#9 리뷰 B6).
 try:
     sock.sendall(struct.pack(">i", len(body) + 4) + body)
-    head = b""
-    while len(head) < 5:
-        chunk = sock.recv(5 - len(head))
-        if not chunk:
-            break
-        head += chunk
-    if len(head) < 5:
-        out("INCONCLUSIVE", "src=%s tls=%s first_message=EOF" % (src, tls))
+    head = read_exact(5)
     mtype = head[:1]
-    mlen = struct.unpack(">i", head[1:5])[0]
-    payload = b""
-    while len(payload) < mlen - 4:
-        chunk = sock.recv(mlen - 4 - len(payload))
-        if not chunk:
-            break
-        payload += chunk
+    mlen = struct.unpack(">i", head[1:])[0]
+    if mlen < 4 or mlen > 65536:
+        raise ValueError("invalid PostgreSQL message length %d" % mlen)
+    payload = read_exact(mlen - 4)
 except Exception as e:
-    # TLS 뒤 응답 대기 timeout·연결 끊김 등은 판정 불가(rc4). 처리하지 않으면 traceback rc1로 끝난다(#9 리뷰 이하영 비차단 1).
     out("INCONCLUSIVE", "src=%s tls=%s startup=%s:%s" % (src, tls, type(e).__name__, e))
 finally:
     try:
@@ -236,17 +236,24 @@ finally:
     except Exception:
         pass
 if mtype == b"R":
-    code = struct.unpack(">i", payload[:4])[0] if len(payload) >= 4 else -1
-    out("ALLOWED", "src=%s tls=%s first_message=R auth_code=%d (인증 요청 = pg_hba 허용 규칙에 걸림)" % (src, tls, code))
+    # 이번 기대 규칙은 hostssl … scram-sha-256이다. AuthenticationSASL(10)이고 NUL로 끝나는 메커니즘 목록에
+    # SCRAM-SHA-256이 있을 때만 허용으로 본다. 다른 인증 코드·형식은 판정 불가.
+    code = struct.unpack(">i", payload[:4])[0] if len(payload) >= 4 else None
+    mechs = payload[4:].split(b"\0") if code == 10 and payload.endswith(b"\0\0") else []
+    if code == 10 and b"SCRAM-SHA-256" in mechs:
+        out("ALLOWED", "src=%s tls=%s first_message=R auth_code=10 mechanisms=%s (인증 요청 = pg_hba 허용 규칙에 걸림)" % (src, tls, ",".join(m.decode() for m in mechs if m)))
+    out("INCONCLUSIVE", "src=%s tls=%s first_message=R auth_code=%s payload_len=%d (SCRAM SASL 요청이 아님)" % (src, tls, code, len(payload)))
 if mtype == b"E":
+    # ErrorResponse: (필드코드 1바이트 + 문자열 + NUL)* + NUL. 끝이 NUL 두 개로 닫히고 C·M 필드가 있어야 한다.
     fields = {}
-    for part in payload.split(b"\0"):
-        if part:
-            fields[part[:1].decode()] = part[1:].decode("utf-8", "replace")
+    if payload.endswith(b"\0\0"):
+        for part in payload[:-1].split(b"\0"):
+            if part:
+                fields[part[:1].decode("ascii", "replace")] = part[1:].decode("utf-8", "replace")
     state, msg = fields.get("C", ""), fields.get("M", "")
     if state == "28000" and "no pg_hba.conf entry" in msg:
         out("REJECTED", "src=%s tls=%s sqlstate=%s message=%s" % (src, tls, state, msg))
-    out("INCONCLUSIVE", "src=%s tls=%s sqlstate=%s message=%s" % (src, tls, state, msg))
+    out("INCONCLUSIVE", "src=%s tls=%s sqlstate=%s message=%s payload_len=%d" % (src, tls, state or "?", msg or "?", len(payload)))
 out("INCONCLUSIVE", "src=%s tls=%s first_message=%r" % (src, tls, mtype))
 PY
     PRC=$?

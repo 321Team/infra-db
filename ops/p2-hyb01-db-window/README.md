@@ -75,13 +75,13 @@
 - 계정은 RUN·단계·시도마다 새로 만든다: `SIM_p2hyb_<RUN에서 T 제외>_W3_1`, `…_W4_1`. 재사용하지 않는다. 과거 회차 행이 있어도 판정에 섞이지 않는다.
 - PC(Git Bash), 단계별 응답 파일을 남긴다:
   ```bash
-  A=SIM_p2hyb_202610081900_W3_1; O=p2-$A.json
+  A=SIM_p2hyb_202610081930_W3_1; O=p2-$A.json
   curl -sS --max-time 10 -o "$O" -w '%{http_code}\n' -X POST http://10.1.93.50/api/v1/transactions -H 'Content-Type: application/json' -d "{\"account_id\":\"$A\",\"amount\":10000,\"transaction_type\":\"deposit\",\"source_ip\":\"198.51.100.10\"}" > "$O.code"; echo "curl_rc=$? http=$(cat "$O.code")"; cat "$O"
   ```
 - 성공은 `curl_rc=0` **그리고** `http=201` **그리고** 응답에 `transaction_id`가 있을 때만이다. rc≠0·timeout 등 응답이 불확실하면 **바로 다시 보내지 않고** 먼저 그 계정의 저장 여부를 db01에서 조회한다.
 - db01(peer)에서 응답의 ID와 계정으로 정확히 1행을 찾는다. `psql -c`로 넘긴 SQL에는 psql 변수(`:'txid'`)가 치환되지 않으므로 **표준 입력(인용 heredoc)으로** 넣는다(#9 리뷰 B4). 값은 응답·요청에서 옮긴다:
   ```bash
-  cd /tmp && sudo -u postgres psql -X -A -d fdsdb -v ON_ERROR_STOP=1 -v txid='<응답 transaction_id>' -v acct='SIM_p2hyb_202610081900_W3_1' <<'SQL'
+  cd /tmp && sudo -u postgres psql -X -A -d fdsdb -v ON_ERROR_STOP=1 -v txid='<응답 transaction_id>' -v acct='SIM_p2hyb_202610081930_W3_1' <<'SQL'
   SELECT account_id, transaction_id, amount, transaction_type, fds_detected, fds_evaluation_skipped
   FROM transactions
   WHERE transaction_id = :'txid' AND account_id = :'acct';
