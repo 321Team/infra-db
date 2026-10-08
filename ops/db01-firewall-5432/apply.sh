@@ -25,15 +25,27 @@ show() {
 }
 
 # --reload는 runtime 전용 규칙을 지우므로 runtime과 permanent가 같은지 먼저 본다.
+# interfaces 줄은 비교에서 뺀다: NetworkManager가 zone에 붙인 인터페이스(connection.zone)는 runtime에만 보이고
+# permanent zone 파일에는 없다(2026-10-08 db01: runtime `ens160 ens192` / permanent 빈 값). 이 바인딩은 --reload 뒤에도
+# 유지되지만, 유지되는지는 apply에서 reload 전후 인터페이스 목록으로 다시 확인한다(rt_ifaces).
 same_rt_perm() {
   # 첫 줄(zone 이름, runtime에만 "(active)")은 비교에서 뺀다.
-  diff <(sudo firewall-cmd --zone="$ZONE" --list-all | tail -n +2) <(sudo firewall-cmd --permanent --zone="$ZONE" --list-all | tail -n +2)
+  diff <(sudo firewall-cmd --zone="$ZONE" --list-all | tail -n +2 | grep -v '^ *interfaces:') <(sudo firewall-cmd --permanent --zone="$ZONE" --list-all | tail -n +2 | grep -v '^ *interfaces:')
+}
+rt_ifaces() { sudo firewall-cmd --zone="$ZONE" --list-interfaces | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' '; }
+# reload 뒤 runtime 인터페이스 바인딩이 그대로인지. 다르면 원상복구 판단이 필요하므로 멈춘다.
+check_ifaces_kept() {
+  local after
+  after=$(rt_ifaces)
+  echo "-- runtime 인터페이스: reload 전 [$IF_BEFORE] / 뒤 [$after]"
+  test "$after" = "$IF_BEFORE" || { echo "STOP: reload 뒤 runtime 인터페이스 바인딩이 바뀜 — rollback 판단" >&2; exit 4; }
 }
 
 case "$MODE" in
   check)
     show
-    if same_rt_perm >/dev/null; then echo "RUNTIME_PERMANENT_MATCH=YES"; else echo "RUNTIME_PERMANENT_MATCH=NO"; same_rt_perm || true; fi
+    if same_rt_perm >/dev/null; then echo "RUNTIME_PERMANENT_MATCH=YES (interfaces 줄 제외)"; else echo "RUNTIME_PERMANENT_MATCH=NO"; same_rt_perm || true; fi
+    echo "runtime interfaces=[$(rt_ifaces)] permanent interfaces=[$(sudo firewall-cmd --permanent --zone="$ZONE" --list-interfaces)]"
     echo "== 적용 예정"
     for s in "${SOURCES[@]}"; do echo "+ $(rule "$s")"; done
     echo "- port ${PORT}/tcp"
@@ -41,6 +53,7 @@ case "$MODE" in
   apply)
     show
     same_rt_perm || { echo "STOP: runtime과 permanent가 다름(--reload 시 runtime 전용 규칙 소실). 원인 확인 후 재실행" >&2; exit 3; }
+    IF_BEFORE=$(rt_ifaces)
     # 승인 출발지를 먼저 열고 나서 전체 개방을 닫는다(승인 경로 끊김 방지).
     for s in "${SOURCES[@]}"; do
       sudo firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$(rule "$s")"
@@ -48,15 +61,18 @@ case "$MODE" in
     sudo firewall-cmd --permanent --zone="$ZONE" --remove-port="${PORT}/tcp"
     sudo firewall-cmd --reload
     show
+    check_ifaces_kept
     ;;
   rollback)
     show
+    IF_BEFORE=$(rt_ifaces)
     sudo firewall-cmd --permanent --zone="$ZONE" --add-port="${PORT}/tcp"
     for s in "${SOURCES[@]}"; do
       sudo firewall-cmd --permanent --zone="$ZONE" --remove-rich-rule="$(rule "$s")" || true
     done
     sudo firewall-cmd --reload
     show
+    check_ifaces_kept
     ;;
   *)
     echo "usage: $0 check|apply|rollback" >&2; exit 2 ;;

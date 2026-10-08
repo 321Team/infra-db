@@ -24,7 +24,7 @@
    - 같은 `check`의 **`fds_app` 사용처 점검**(Secret·ConfigMap 값, 워크로드 spec 리터럴, 이 Secret을 이름으로 참조하는 워크로드. 값은 출력하지 않고 위치만)이 `Secret fds-app/transaction-api-db-credentials DATABASE_URL` 1줄과 `Deployment fds-app/transaction-api (Secret 참조)` 1줄이고 `사용처 점검 rc=0`이어야 한다. 다른 줄이 있거나 rc≠0이면 D는 하지 않고 보고한다(rollout은 transaction-api만 하므로 다른 사용처는 교체 뒤 옛 값으로 인증 실패한다). CronJob이 만든 Job도 별도 줄로 나오므로(Pod만 ownerReferences로 제외) 이런 줄도 "다른 줄"로 보고 D를 하지 않는다(이하영 재리뷰 비차단 메모).
    - 같은 `check`의 `last-applied=`가 `present`이면 그 주석에 현재 값이 들어 있을 수 있다. D의 patch가 같은 요청에서 주석을 지우고 `absent`를 확인한다(`absent`이면 변화 없음). 어느 쪽이든 기록한다.
    - 2026-10-07 18:4x control01 조회(값 가림): `postgresql+asyncpg://fds_app:***@10.1.93.55:5432/fdsdb` — **SSL 파라미터 없음.** asyncpg 기본(prefer)으로 SSL을 협상하고, db01 원격 허용은 `hostssl`뿐이라 평문 연결은 거부된다(앱이 지금 접속 중인 것이 SSL 협상의 근거). D는 비밀번호 부분만 바꾸고 쿼리는 그대로 둔다. `?ssl=require` 명시는 접속 설정 변경이라 이 창에 섞지 않고 후속으로 둔다.
-5. db01 `apply.sh check`의 `RUNTIME_PERMANENT_MATCH=YES`, `db01.sh check`의 pg_hba 오류 0·`.50` 대상 줄 1.
+5. db01 `apply.sh check`의 `RUNTIME_PERMANENT_MATCH=YES`(`interfaces:` 줄 제외 비교, `ops/db01-firewall-5432/README.md` 4번), `db01.sh check`의 pg_hba 오류 0·`.50` 대상 줄 1.
 
 ## 3. 영향
 
