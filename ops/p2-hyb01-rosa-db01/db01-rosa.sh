@@ -202,8 +202,21 @@ case "$MODE" in
     show
     # 역순. 각 단계는 해당 변경이 있을 때만 되돌리고, 마지막 readback으로 판정한다.
     if sudo -u postgres test -f "$SEC/pg_hba.conf.before"; then
-      sudo -u postgres sh -c 'cat "$1" > "$2"' sh "$SEC/pg_hba.conf.before" "$HBA" || die "pg_hba.conf 복원 실패"
-      reload_pg
+      # 현재 파일이 a2-apply 결과(after)와 같을 때만 사본으로 되돌린다. 그 사이 다른 승인된 pg_hba 변경이
+      # 있었으면 덮어쓰지 않고 멈춘다(infra-db#12 하영 리뷰 비차단 1). 이미 before와 같으면 복원은 건너뛴다.
+      # 이 단계에서 멈추면 방화벽·경로는 아직 바꾸지 않은 상태다.
+      CUR=$(sudo sha256sum "$HBA" | cut -d' ' -f1)
+      BEF=$(sudo sha256sum "$SEC/pg_hba.conf.before" | cut -d' ' -f1)
+      AFT=$(sudo sha256sum "$SEC/pg_hba.conf.after" 2>/dev/null | cut -d' ' -f1)
+      echo "-- pg_hba sha256 현재=$CUR before=$BEF after=${AFT:-없음}"
+      if test -n "$CUR" && test "$CUR" = "$BEF"; then
+        echo "-- pg_hba가 이미 before와 같음: 복원 건너뜀"
+      elif test -n "$CUR" && test -n "$AFT" && test "$CUR" = "$AFT"; then
+        sudo -u postgres sh -c 'cat "$1" > "$2"' sh "$SEC/pg_hba.conf.before" "$HBA" || die "pg_hba.conf 복원 실패"
+        reload_pg
+      else
+        die "현재 pg_hba가 a2-apply 결과(after)·이전(before) 어느 쪽과도 다름 — 다른 변경이 있었을 수 있어 덮어쓰지 않는다. 수동 판단(방화벽·경로는 아직 그대로)"
+      fi
     else
       echo "-- pg_hba 사본 없음: pg_hba는 바꾸지 않았던 것으로 본다(대상 줄 수 $(sudo grep -cE "$HBA_RE" "$HBA"))"
     fi

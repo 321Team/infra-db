@@ -133,6 +133,17 @@ KEEP_DIR=$A2 run "a2-rollback: a2-apply 뒤 전체 원복" a2-rollback 0 'RESULT
 cmp -s "$T/hba" "$A2/root/var/lib/pgsql/data/pg_hba.conf" && echo "PASS a2-rollback: pg_hba 원본과 같음" || { echo "FAIL a2-rollback: pg_hba 다름"; FAILS=$((FAILS + 1)); }
 rm -f "$A2/mut"
 KEEP_DIR=$A2 run "a2-apply: 같은 RUN 재적용 거부(사본 있음)" a2-apply 3 '이전 사본이 이미 있음' ""
+rm -f "$A2/mut"
+KEEP_DIR=$A2 run "a2-rollback: 이미 원복된 뒤 재실행은 복원 건너뜀(변경 0)" a2-rollback 0 '이미 before와 같음' ""
+
+# a2-apply 뒤 다른 승인된 pg_hba 변경이 생긴 경우: 덮어쓰지 않고 방화벽·경로도 건드리지 않고 멈춘다(SHA 가드).
+run "a2-apply(가드 시험 준비)" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
+G=$LAST_DIR; rm -f "$G/mut"
+echo 'host all all 10.9.9.9/32 reject' >> "$G/root/var/lib/pgsql/data/pg_hba.conf"
+cp "$G/root/var/lib/pgsql/data/pg_hba.conf" "$G/hba.changed"
+KEEP_DIR=$G run "a2-rollback: pg_hba가 after와 다르면 덮어쓰지 않고 멈춤(변경 0)" a2-rollback 3 'before) 어느 쪽과도 다름' ""
+cmp -s "$G/hba.changed" "$G/root/var/lib/pgsql/data/pg_hba.conf" && echo "PASS a2-rollback 가드: 변경된 pg_hba 보존" || { echo "FAIL a2-rollback 가드: pg_hba가 바뀜"; FAILS=$((FAILS + 1)); }
+
 FAKE_HOST=edge01 run "db01이 아니면 멈춤" check 2 'db01이 아님' ""
 
 # render-hba: 마지막 fds_app hostssl 줄 바로 뒤에 1줄
