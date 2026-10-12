@@ -90,6 +90,21 @@ nm_has() {
 hba_errors() { pg -c "SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL"; }
 hba_new_rows() { pg -c "SELECT count(*) FROM pg_hba_file_rules WHERE address = '10.20.10.0' AND netmask = '255.255.255.0'"; }
 hba_rules() { pg -c "SELECT line_number, type, array_to_string(database,','), array_to_string(user_name,','), coalesce(address,''), coalesce(netmask,''), auth_method FROM pg_hba_file_rules ORDER BY line_number"; }
+# 10.20.10.x 출발지에 매칭될 수 있는 허용 줄(reject 제외). exact 줄뿐 아니라 all·samenet·samehost, 이 대역을
+# 포함하거나 이 대역 안에 있는 IPv4 CIDR, 호스트 이름 줄(판정 불가 → 보수적으로 포함)을 모두 낸다.
+# 사전 창은 인증 경로를 열지 않아야 하므로 하나라도 있으면 멈춘다(#47 6116037629 하영 조건 1).
+HBA_BROAD_SQL="SELECT line_number || ' ' || type || ' ' || array_to_string(database,',') || ' ' || array_to_string(user_name,',') || ' ' || coalesce(address,'') || ' ' || coalesce(netmask,'') || ' ' || auth_method
+FROM pg_hba_file_rules
+WHERE error IS NULL AND type LIKE 'host%' AND auth_method <> 'reject' AND (
+  address IN ('all','samenet','samehost')
+  OR (address ~ '^[0-9.]+\$' AND netmask ~ '^[0-9.]+\$' AND (
+       (inet '10.20.10.0' & netmask::inet) = (address::inet & netmask::inet)
+       OR address::inet << inet '10.20.10.0/24'))
+  OR (address !~ '^[0-9.:]+\$' AND address NOT IN ('all','samenet','samehost')))
+ORDER BY line_number"
+hba_broad() { pg -c "$HBA_BROAD_SQL"; }
+# 인증 전 연결도 backend 슬롯을 쓰므로 창 전후 여유를 기록한다(하영 조건 2).
+conn_headroom() { pg -c "SELECT 'max_connections=' || current_setting('max_connections') || ' superuser_reserved=' || current_setting('superuser_reserved_connections') || ' sessions=' || (SELECT count(*) FROM pg_stat_activity) || ' authentication_timeout=' || current_setting('authentication_timeout')"; }
 hba_file_ok() { test "$(pg -c 'SHOW hba_file')" = "$HBA"; }
 # db01.sh와 같은 기준: pg_reload_conf()는 신호 전송 결과 t일 때만 통과. 실제 적용 판정은 아니다.
 reload_pg() { local s; s=$(pg -c "SELECT pg_reload_conf()") || die "pg_reload_conf SQL 실패"; test "$s" = t || die "pg_reload_conf 결과 '$s'"; sleep 2; echo "-- pg_reload_conf=t ($(date '+%T'))"; }
@@ -107,6 +122,15 @@ show() {
   echo "-- pg_hba.conf sha256: $(sudo sha256sum "$HBA" | cut -d' ' -f1)  대상 줄 수(파일): $(sudo grep -cE "$HBA_RE" "$HBA")"
   echo "-- 서버 hba_file 일치=$(hba_file_ok && echo YES || echo NO), pg_hba_file_rules 오류=$(hba_errors), $SRC 규칙=$(hba_new_rows)"
   echo "-- $TUN 출발지 세션 수: $(pg -c "SELECT count(*) FROM pg_stat_activity WHERE client_addr << '$TUN'")"
+  echo "-- 연결 여유: $(conn_headroom)"
+  local b; b=$(hba_broad) || b=QUERY_ERROR
+  echo "-- 10.20.10.x에 매칭될 수 있는 pg_hba 허용 줄(넓은 범위 포함, reject 제외): $(test -z "$b" && echo 없음 || printf '%s' "$b" | grep -c .)"
+  test -z "$b" || printf '%s\n' "$b" | sed 's/^/   /'
+}
+# 사전 조건: 매칭 허용 줄이 없어야 한다. 조회 실패도 멈춘다.
+need_no_broad() {
+  local b; b=$(hba_broad) || die "pg_hba 매칭 줄 조회 실패. 변경하지 않았다"
+  test -z "$b" || die "10.20.10.x에 매칭되는 pg_hba 허용 줄이 이미 있음(위 목록) — 인증 경로가 열린 상태라 변경하지 않았다"
 }
 
 case "$MODE" in
@@ -126,6 +150,7 @@ case "$MODE" in
     test "$(fw_state)" = absent && test "$(fw_state --permanent)" = absent || die "rich rule이 이미 있거나 조회 실패. 변경하지 않았다"
     test "$(route_state)" = absent || die "복귀 경로가 이미 있거나 조회 실패. 변경하지 않았다"
     gw_onlink || die "$GW가 직접 연결(on-link) 경로가 아님. 변경하지 않았다"
+    need_no_broad
     sudo firewall-cmd --zone="$ZONE" --add-rich-rule="$RULE" || die "runtime rule 추가 실패 → pre-rollback"
     sudo ip route add "$TUN" via "$GW" || die "경로 추가 실패 → pre-rollback"
     show
@@ -159,6 +184,7 @@ case "$MODE" in
     hba_file_ok || die "서버 hba_file이 $HBA 가 아님. 변경하지 않았다"
     test "$(hba_errors)" = 0 || die "적용 전 pg_hba_file_rules 오류. 변경하지 않았다"
     test "$(hba_new_rows)" = 0 || die "$SRC 규칙이 이미 있음. 변경하지 않았다"
+    need_no_broad
     sudo -u postgres mkdir -p -m 700 "$SEC" || die "$SEC 생성 실패. 변경하지 않았다"
     sudo -u postgres test -e "$SEC/pg_hba.conf.before" && die "이전 사본이 이미 있음. 같은 RUN으로 재적용하지 않는다"
     sudo -u postgres cp -p "$HBA" "$SEC/pg_hba.conf.before" || die "사본 저장 실패. 변경하지 않았다"
@@ -190,6 +216,10 @@ case "$MODE" in
     echo "-- pg_hba_file_rules(후)"; hba_rules | tee "$LOGDIR/hba-rules.after" || die "pg_hba_file_rules 조회 실패 → a2-rollback"
     test "$(hba_errors)" = 0 || die "reload 뒤 pg_hba_file_rules 오류 → a2-rollback"
     test "$(hba_new_rows)" = 1 || die "reload 뒤 $SRC 규칙 수가 1이 아님 → a2-rollback"
+    # 매칭 허용 줄은 새로 넣은 1줄뿐이어야 한다.
+    BROAD_AFTER=$(hba_broad) || die "reload 뒤 매칭 줄 조회 실패 → a2-rollback"
+    test "$(printf '%s\n' "$BROAD_AFTER" | grep -c .)" = 1 && test "$(printf '%s\n' "$BROAD_AFTER" | grep -cF ' 10.20.10.0 255.255.255.0 scram-sha-256')" = 1 \
+      || die "reload 뒤 10.20.10.x 매칭 허용 줄이 새 줄 1개가 아님 → a2-rollback"
     # 새 줄을 뺀 나머지 규칙은 순서·내용이 그대로여야 한다(줄 번호는 삽입 뒤 1씩 밀릴 수 있어 비교에서 뺀다).
     diff <(cut -d'|' -f2- "$LOGDIR/hba-rules.before") <(cut -d'|' -f2- "$LOGDIR/hba-rules.after" | grep -vF '|10.20.10.0|255.255.255.0|') \
       || die "기존 pg_hba 규칙 순서·내용이 바뀜 → a2-rollback"

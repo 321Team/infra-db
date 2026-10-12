@@ -31,9 +31,19 @@
 
 ## 사전 제한 시험 창 (6076566493 W0~W4)
 
+[하영 DB 위험 확인 6116037629](https://github.com/321Team/fds-project-baseline/issues/47#issuecomment-6116037629)의 조건부 수용 조건을 따릅니다.
+- **매칭 허용 줄 검사(조건 1):** `check`가 pg_hba에서 `10.20.10.x`에 매칭될 수 있는 허용 줄을 모두 출력합니다. `reject`는 제외합니다. 대상은 다음과 같습니다.
+  - `all`·`samenet`·`samehost`
+  - 이 대역을 포함하거나 이 대역 안에 있는 IPv4 CIDR
+  - 판정할 수 없는 호스트 이름 줄(보수적으로 포함)
+
+  `pre-apply`·`a2-apply`는 이런 줄이 하나라도 있으면 변경 0건으로 멈춥니다. a2-apply 뒤에는 매칭 허용 줄이 새로 넣은 1줄뿐인지 다시 확인합니다.
+- **연결 여유(조건 2):** `check`가 `max_connections`·`superuser_reserved_connections`·현재 세션 수·`authentication_timeout`을 기록합니다.
+- **조건 3·4·7(출발지 probe 1대, DB 로그인 금지, #37 선행)과 5(W3·W4 판정):** 실행 절차로 지킵니다. 조건 6은 아래 "기록"의 blob SHA 대조입니다.
+
 | 단계 | 명령 | 통과 기준 |
 |---|---|---|
-| W0 | `bash db01-rosa.sh check <RUN>`, `bash ../db01-firewall-5432/apply.sh check` | rule runtime·permanent 모두 absent, 경로 absent, `MATCH=YES`, `10.1.93.51` on-link=YES, `10.20.10.0/24` pg_hba 규칙 0 |
+| W0 | `bash db01-rosa.sh check <RUN>`, `bash ../db01-firewall-5432/apply.sh check` | rule runtime·permanent 모두 absent, 경로 absent, `MATCH=YES`, `10.1.93.51` on-link=YES, `10.20.10.0/24` pg_hba 규칙 0, **10.20.10.x에 매칭될 수 있는 pg_hba 허용 줄 없음**, 연결 여유(`max_connections`·`superuser_reserved_connections`·세션 수·`authentication_timeout`) 기록 |
 | W1 | `bash db01-rosa.sh pre-apply <RUN>` | `RESULT pre-apply=OK`(rule runtime present / permanent absent, `ip route get 10.20.10.10`이 `via 10.1.93.51`) |
 | W2 | (#37) T3·T6. db01: `sudo timeout 120 tcpdump -nni any 'tcp port 5432 and net 10.20.0.0/16'` | T3 출발지 `10.20.10.x`, T6 도달 없음 |
 | W3 | `check`의 pg_hba 줄이 W0와 같은지 대조 | `10.20.10.0/24` 규칙 0. 인증 계층 불변 |
@@ -78,6 +88,7 @@ bash ops/p2-hyb01-rosa-db01/tests/test_db01_rosa.sh
 
 hostname·sudo·firewall-cmd·ip·nmcli·psql을 가짜로 바꿔 실행합니다. 서버 접속·변경은 없습니다. 판정은 마지막 줄 `FAILS=0`입니다. 확인하는 것:
 - 모드별 변경 목록과 순서
+- pg_hba 매칭 허용 줄 검사: `0.0.0.0/0`·`10.0.0.0/8`·`samenet` 줄이 있으면 pre-apply·a2-apply가 변경 0으로 멈추거나 `check`가 목록으로 보고, reject 줄은 제외
 - a2-rollback SHA 가드: a2-apply 뒤 pg_hba가 바뀌었으면 덮어쓰지 않고 변경 0으로 멈춤, 이미 원복됐으면 복원 건너뜀
 - 이미 있는 rule·경로·NM 경로, runtime·permanent 불일치, 같은 RUN 재적용이면 변경 0으로 멈춤
 - a2-apply → a2-rollback 왕복 뒤 pg_hba가 원본과 같음

@@ -70,8 +70,17 @@ rules() {
     else { split($4,a,"/"); addr=a[1]; m=a[2]+0; mask=(m==32?"255.255.255.255":(m==24?"255.255.255.0":(m==0?"0.0.0.0":"x"))) }
     printf "%d|%s|%s|%s|%s|%s|%s\n", NR, $1, $2, $3, addr, mask, auth }' "$h"
 }
+# 10.20.10.x 매칭 허용 줄(모의): host* 줄 중 reject가 아니고 주소가 all·samenet·samehost이거나
+# 이 대역을 덮는 대표 CIDR(0.0.0.0/0·10.0.0.0/8·10.20.0.0/16)이거나 10.20.10.x 안의 주소.
+broad() {
+  rules | awk -F'|' '$2 ~ /^host/ && $7 != "reject" &&
+    ($5 ~ /^(all|samenet|samehost)$/ || ($5 == "0.0.0.0" && $6 == "0.0.0.0") || ($5 == "10.0.0.0") || ($5 == "10.20.0.0") || $5 ~ /^10\.20\.10\./) {
+      print $1 " " $2 " " $3 " " $4 " " $5 " " $6 " " $7 }'
+}
 case "$*" in
   *"SHOW hba_file"*) echo "$h" ;;
+  *"auth_method <> 'reject'"*) broad ;;
+  *max_connections*) echo "max_connections=100 superuser_reserved=3 sessions=7 authentication_timeout=1min" ;;
   *"address = '10.20.10.0'"*) rules | grep -cF '|10.20.10.0|255.255.255.0|' ;;
   *count*) echo 0 ;;
   *pg_reload_conf*) echo t ;;
@@ -101,6 +110,7 @@ run() {
   test -n "${NMROUTE:-}" && echo "10.20.0.0/16 10.1.93.51" > "$d/nm"
   mkdir -p "$d/root/var/lib/pgsql/data" "$d/root/var/lib/pgsql/fds-evidence"
   cp "$T/hba" "$d/root/var/lib/pgsql/data/pg_hba.conf"
+  test -n "${EXTRA_HBA:-}" && echo "$EXTRA_HBA" >> "$d/root/var/lib/pgsql/data/pg_hba.conf"
   test -n "${KEEP_DIR:-}" && d=$KEEP_DIR
   out=$(FAKE_DIR=$d FAKE_HBA=$d/root/var/lib/pgsql/data/pg_hba.conf DB01_ROSA_TEST_ROOT=$d/root HOME=$d/home     PATH="$T/bin:$PATH" bash "$S" "$2" 20261021T1000 2>&1); rc=$?
   mut=$(test -f "$d/mut" && tr '\n' ',' < "$d/mut" | sed 's/,$//')
@@ -144,6 +154,11 @@ cp "$G/root/var/lib/pgsql/data/pg_hba.conf" "$G/hba.changed"
 KEEP_DIR=$G run "a2-rollback: pg_hba가 after와 다르면 덮어쓰지 않고 멈춤(변경 0)" a2-rollback 3 'before) 어느 쪽과도 다름' ""
 cmp -s "$G/hba.changed" "$G/root/var/lib/pgsql/data/pg_hba.conf" && echo "PASS a2-rollback 가드: 변경된 pg_hba 보존" || { echo "FAIL a2-rollback 가드: pg_hba가 바뀜"; FAILS=$((FAILS + 1)); }
 
+# 10.20.10.x에 매칭되는 넓은 허용 줄이 이미 있으면 사전 창·A2 모두 변경 0으로 멈춘다(#47 하영 조건 1).
+EXTRA_HBA='host all all 0.0.0.0/0 scram-sha-256' run "pre-apply: 0.0.0.0/0 허용 줄 있음 → 변경 0" pre-apply 3 '매칭되는 pg_hba 허용 줄이 이미 있음' ""
+EXTRA_HBA='hostssl all all 10.0.0.0/8 scram-sha-256' run "a2-apply: 10.0.0.0/8 허용 줄 있음 → 변경 0" a2-apply 3 '매칭되는 pg_hba 허용 줄이 이미 있음' ""
+EXTRA_HBA='hostssl all all samenet scram-sha-256' run "check: samenet 허용 줄을 목록으로 보고(변경 0)" check 0 '허용 줄(넓은 범위 포함, reject 제외): 1' ""
+run "check: reject 줄만 있으면 매칭 허용 줄 없음, 연결 여유 기록" check 0 '허용 줄(넓은 범위 포함, reject 제외): 없음' ""
 FAKE_HOST=edge01 run "db01이 아니면 멈춤" check 2 'db01이 아님' ""
 
 # render-hba: 마지막 fds_app hostssl 줄 바로 뒤에 1줄
