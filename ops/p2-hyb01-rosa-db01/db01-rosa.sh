@@ -240,7 +240,7 @@ case "$MODE" in
       NOW_RULES=$(fw_rules_sha) || NOW_RULES=QUERY_ERROR
       if test "$(fw_state)" = absent && test "$(fw_state --permanent)" = absent && test "$(route_state)" = absent \
          && test -n "$W0_RULES" && test "$NOW_RULES" = "$W0_RULES"; then
-        echo "RESULT pre-rollback=ALREADY_DONE $(date '+%T') — 이미 원복한 RUN. 변경 0, 현재 상태 W0와 같음"
+        echo "RESULT pre-rollback=ALREADY_DONE $(date '+%T') — 이 RUN의 완료 기록 있음. rule·경로 부재와 runtime rich rule 목록만 재확인, 변경 0"
         exit 0
       fi
       die "이미 원복한 RUN($RUN)이고 현재 상태가 W0와 다름(다른 RUN의 변경일 수 있음) — 지우지 않았다. 수동 판단"
@@ -277,7 +277,8 @@ case "$MODE" in
     # runtime=permanent만으로 W0 복원이라 단정하지 않는다. W0 runtime rich rule 목록과 같아야 한다.
     NOW_RULES=$(fw_rules_sha) || die "runtime rich rule 목록 조회 실패 — 원복 완료 판정 금지"
     test -n "$W0_RULES" && test "$NOW_RULES" = "$W0_RULES" || die "runtime rich rule 목록이 W0와 다름(W0=${W0_RULES:-없음} 현재=$NOW_RULES) — 수동 대조"
-    # W3: 사전 창은 pg_hba를 바꾸지 않는다. 파일·로드된 규칙 해시가 W0와 같아야 한다(하영 비차단 2).
+    # W3: 사전 창은 pg_hba를 바꾸지 않는다. 파일 해시와 pg_hba_file_rules(현재 파일의 해석 결과, 서버 적재 상태 아님)
+    # 해시가 W0와 같아야 한다(하영 비차단 2).
     W0_HBA=$(w0_get "$RCPT" hba_sha); W0_HRULES=$(w0_get "$RCPT" hba_rules_sha)
     NOW_HBA=$(hba_file_sha) && NOW_HRULES=$(hba_rules_sha) || die "W3 pg_hba 해시 조회 실패 — 원복 완료 판정 금지"
     test -n "$W0_HBA" && test "$NOW_HBA" = "$W0_HBA" && test "$NOW_HRULES" = "$W0_HRULES" \
@@ -378,7 +379,7 @@ case "$MODE" in
       if test "$(fw_state)" = absent && test "$(fw_state --permanent)" = absent && test "$(route_state)" = absent \
          && test "$(nm_state "$R_UUID")" = absent && test "$(hba_new_rows)" = 0 \
          && test -n "$W0_RULES" && test "$NOW_RULES" = "$W0_RULES"; then
-        echo "RESULT a2-rollback=ALREADY_DONE $(date '+%T') — 이미 원복한 RUN. 변경 0, 현재 상태 W0와 같음"
+        echo "RESULT a2-rollback=ALREADY_DONE $(date '+%T') — 이 RUN의 완료 기록 있음. rule·경로·NM(W0 UUID)·$SRC pg_hba 줄 부재와 runtime rich rule 목록만 재확인, 변경 0"
         exit 0
       fi
       die "이미 원복한 RUN($RUN)이고 현재 상태가 W0와 다름(다른 RUN의 변경일 수 있음) — 지우지 않았다. 수동 판단"
@@ -394,7 +395,10 @@ case "$MODE" in
       AFT=$(sudo sha256sum "$SEC/pg_hba.conf.after" 2>/dev/null | cut -d' ' -f1)
       echo "-- pg_hba sha256 현재=$CUR before=$BEF after=${AFT:-없음}"
       if test -n "$CUR" && test "$CUR" = "$BEF"; then
-        echo "-- pg_hba가 이미 before와 같음: 복원 건너뜀"
+        # 이전 실행이 복원 직후 reload에 실패했거나 그 전에 끊겼을 수 있다. 파일 일치는 서버가 다시 읽었다는
+        # 증거가 아니므로(pg_hba_file_rules도 파일 내용일 뿐) 여기서도 reload하고, 실패하면 완료로 보지 않는다(권욱 R1).
+        echo "-- pg_hba가 이미 before와 같음: 파일 복원 건너뜀, 서버 적재를 위해 reload"
+        reload_pg
       elif test -n "$CUR" && test -n "$AFT" && test "$CUR" = "$AFT"; then
         sudo -u postgres sh -c 'cat "$1" > "$2"' sh "$SEC/pg_hba.conf.before" "$HBA" || die "pg_hba.conf 복원 실패"
         reload_pg

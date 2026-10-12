@@ -92,7 +92,13 @@ case "$*" in
   *"address = '10.20.10.0'"*) rules | grep -cF '|10.20.10.0|255.255.255.0|' ;;
   *"error IS NOT NULL"*) echo "${FAKE_HBA_ERRORS:-0}" ;;
   *count*) echo 0 ;;
-  *pg_reload_conf*) echo t ;;
+  *pg_reload_conf*)
+    # reload 시도는 FAKE_DIR/pgreload에, 성공하면 그 시점 파일을 서버 적재 모형 FAKE_DIR/loaded_hba로 둔다.
+    # FAKE_DIR/reload_fail_once 또는 FAKE_RELOAD_FAIL이 있으면 f(적재 안 함)를 돌려준다(권욱 R1 시험).
+    echo try >> "$FAKE_DIR/pgreload"
+    if test -f "$FAKE_DIR/reload_fail_once"; then rm -f "$FAKE_DIR/reload_fail_once"; echo f; exit 0; fi
+    test -n "${FAKE_RELOAD_FAIL:-}" && { echo f; exit 0; }
+    cp "$h" "$FAKE_DIR/loaded_hba"; echo t ;;
   *pg_hba_file_rules*) rules ;;
 esac
 exit 0
@@ -242,6 +248,35 @@ PW=$LAST_DIR; rm -f "$PW/mut"
 sed -i '/^DONE hba$/d' "$PW/home/p2-hyb01-rosa-20261021T1000/a2.receipt"
 head -2 "$PW/root/var/lib/pgsql/data/pg_hba.conf" > "$PW/hba.cut"; cp "$PW/hba.cut" "$PW/root/var/lib/pgsql/data/pg_hba.conf"
 KEEP_DIR=$PW run "a2-rollback: 잘린 pg_hba + DONE hba 없음 → 수동 복원 안내, 변경 0" a2-rollback 3 '잘린 파일일 수 있다' ""
+
+# 권욱 R1 — pg_hba 파일 복원 뒤 reload가 실패·중단된 원복을 재시도하면 reload를 다시 하고, 실패하면 완료로 보지 않는다.
+ROSA_LINE='hostssl fdsdb fds_app 10.20.10.0/24 scram-sha-256'
+loaded_has_rosa() { grep -qxF "$ROSA_LINE" "$1/loaded_hba"; }
+reloads() { test -f "$1/pgreload" && wc -l < "$1/pgreload" | tr -d ' ' || echo 0; }
+run "a2-apply(R1 reload 실패 시험 준비)" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
+RA=$LAST_DIR; rm -f "$RA/mut"
+loaded_has_rosa "$RA" && echo "PASS R1 준비: 서버 적재 모형에 ROSA 줄 있음" || { echo "FAIL R1 준비: 적재 모형"; FAILS=$((FAILS + 1)); }
+touch "$RA/reload_fail_once"; N0=$(reloads "$RA")
+KEEP_DIR=$RA run "a2-rollback: 파일 복원 뒤 reload 실패 → STOP(방화벽·경로는 그대로)" a2-rollback 3 "pg_reload_conf 결과 'f'" ""
+cmp -s "$T/hba" "$RA/root/var/lib/pgsql/data/pg_hba.conf" && loaded_has_rosa "$RA" && ! grep -q '^DONE rollback ' "$RA/home/p2-hyb01-rosa-20261021T1000/a2.receipt" \
+  && echo "PASS R1: 파일은 before, 서버 적재 모형은 ROSA 줄 그대로, 완료 기록 없음" || { echo "FAIL R1: 첫 실패 뒤 상태"; FAILS=$((FAILS + 1)); }
+rm -f "$RA/mut"
+KEEP_DIR=$RA run "a2-rollback: 같은 RUN 재시도 → 파일은 건너뛰고 reload 재시도 후 원복 완료" a2-rollback 0 'RESULT a2-rollback=OK' "remove perm,reload,nm del,route del"
+test "$(reloads "$RA")" = $((N0 + 2)) && ! loaded_has_rosa "$RA" && grep -q '^DONE rollback ' "$RA/home/p2-hyb01-rosa-20261021T1000/a2.receipt" \
+  && echo "PASS R1: reload 총 2회(실패 1+재시도 1), 서버 적재 모형에서 ROSA 줄 제거" || { echo "FAIL R1: reload 재시도 $(reloads "$RA")회"; FAILS=$((FAILS + 1)); }
+# 파일 복원 직후 reload 전에 끊긴 경우(파일만 before, 적재는 after)
+run "a2-apply(R1 중단 시험 준비)" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
+RB=$LAST_DIR; rm -f "$RB/mut"
+cp "$T/hba" "$RB/root/var/lib/pgsql/data/pg_hba.conf"
+KEEP_DIR=$RB run "a2-rollback: 복원 직후 중단 뒤 재실행 → reload 후 원복 완료" a2-rollback 0 'RESULT a2-rollback=OK' "remove perm,reload,nm del,route del"
+! loaded_has_rosa "$RB" && echo "PASS R1 중단: 서버 적재 모형에서 ROSA 줄 제거" || { echo "FAIL R1 중단: 적재 모형에 ROSA 줄 남음"; FAILS=$((FAILS + 1)); }
+# 재시도 reload도 실패하면 완료 기록 없이 계속 STOP
+run "a2-apply(R1 반복 실패 시험 준비)" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
+RC=$LAST_DIR; rm -f "$RC/mut"
+FAKE_RELOAD_FAIL=1 KEEP_DIR=$RC run "a2-rollback: reload 실패(1회차)" a2-rollback 3 "pg_reload_conf 결과 'f'" ""
+FAKE_RELOAD_FAIL=1 KEEP_DIR=$RC run "a2-rollback: 재시도 reload도 실패 → STOP, 변경 0" a2-rollback 3 "pg_reload_conf 결과 'f'" ""
+! grep -q '^DONE rollback ' "$RC/home/p2-hyb01-rosa-20261021T1000/a2.receipt" && loaded_has_rosa "$RC" && grep -qxF "$RULE" "$RC/perm" \
+  && echo "PASS R1 반복 실패: 완료 기록 없음, 방화벽 rule·적재 모형 그대로" || { echo "FAIL R1 반복 실패"; FAILS=$((FAILS + 1)); }
 
 # a2-apply 뒤 다른 승인된 pg_hba 변경이 생긴 경우: 덮어쓰지 않고 방화벽·경로도 건드리지 않고 멈춘다(SHA 가드).
 run "a2-apply(가드 시험 준비)" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
