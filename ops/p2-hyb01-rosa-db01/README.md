@@ -46,8 +46,8 @@
 | W0 | `bash db01-rosa.sh check <RUN>`, `bash ../db01-firewall-5432/apply.sh check` | **`W0_READY(pre-apply)=YES`**(rc0만으로 판단하지 않음). 그 내용: rule runtime·permanent 모두 absent, 경로 absent, NM 영구 경로 absent, `MATCH=YES`, `10.1.93.51` on-link=YES, `hba_file` 일치, pg_hba 오류 0, `10.20.10.0/24` pg_hba 규칙 0, **10.20.10.x에 매칭될 수 있는 pg_hba 허용 줄 없음**, 연결 여유(`max_connections`·`superuser_reserved_connections`·세션 수·`authentication_timeout`)·runtime rich rule 목록 해시 조회 성공. 실행 환경(스크립트 SHA·도구 버전·identity) 기록 |
 | W1 | `bash db01-rosa.sh pre-apply <RUN>` | `RESULT pre-apply=OK`(rule runtime present / permanent absent, `ip route get 10.20.10.10`이 `via 10.1.93.51`). 첫 쓰기 전에 W0 가드를 다시 통과해야 하고, 기준선과 단계별 INTENT/DONE이 `~/p2-hyb01-rosa-<RUN>/pre.receipt`에 남음. 마지막 시험 시작·W4 시작·완료 상한 시각을 출력 |
 | W2 | (#37) T3·T6. db01: `sudo timeout 120 tcpdump -nni any 'tcp port 5432 and net 10.20.0.0/16'` | T3 출발지 `10.20.10.x`. T6 판정은 #37 RUN 기준(캡처 정상 기동·관측 구간·실제 시도, Relay missing-IPsec counter, 외부 평문 미관측, 전후 T3 성공). **db01 패킷 없음만으로 차단 PASS 아님**, timeout·도구 실패는 판정 불가 |
-| W3 | `check`의 pg_hba 줄이 W0와 같은지 대조 | `10.20.10.0/24` 규칙 0. 인증 계층 불변(파일 불변은 "이번 창에서 인증 설정을 안 바꿈"이지 인증 거부 실증이 아님) |
-| W4 | `bash db01-rosa.sh pre-rollback <RUN>` | `RESULT pre-rollback=OK — W0 대조 일치`(이 RUN이 넣은 rule·경로만 삭제, 모두 absent, `MATCH=YES`, runtime rich rule 목록이 W0와 같음). 정리 뒤 `10.20.0.0/16` 출발지 세션 수 확인(임의 kill 금지) |
+| W3 | `check`의 pg_hba 줄이 W0와 같은지 대조. `pre-rollback`이 자동으로도 대조 | `10.20.10.0/24` 규칙 0. 인증 계층 불변: W0 receipt의 pg_hba 파일 해시·`pg_hba_file_rules` 해시와 같음(하영 비차단 2). 파일 불변은 "이번 창에서 인증 설정을 안 바꿈"이지 인증 거부 실증이 아님 |
+| W4 | `bash db01-rosa.sh pre-rollback <RUN>` | `RESULT pre-rollback=OK — W0·W3 대조 일치`(이 RUN이 넣은 rule·경로만 삭제, 모두 absent, `MATCH=YES`, runtime rich rule 목록·pg_hba 해시가 W0와 같음). 완료 기록을 쓰지 못하면 OK를 내지 않음. 정리 뒤 `10.20.0.0/16` 출발지 세션 수 확인(임의 kill 금지) |
 
 ### 창 카드에 고정할 항목 (권욱 B1)
 
@@ -68,6 +68,8 @@
 - 이 RUN이 넣지 않은 항목(INTENT 없음, 다른 next-hop 경로)이 있음 — 자기 것만 정리하고 멈춤
 - 조회 실패 — 원복 완료 판정을 내지 않음
 - 원복 뒤 runtime rich rule 목록이 W0와 다름(창 도중 다른 변경)
+- 원복 뒤 pg_hba 파일·`pg_hba_file_rules` 해시가 W0와 다름(W3) — 자기 rule·경로는 정리하고 멈춤
+- **이미 원복을 마친 RUN**(receipt에 `DONE rollback`) — 다시 지우지 않습니다(권욱 B3-a). 현재 상태가 W0와 같으면 `ALREADY_DONE`(변경 0)으로 끝나고, 다르면(뒤에 다른 RUN이 적용했을 수 있음) 멈춥니다
 
 ## A2 (10/21 창, §4-3)
 
@@ -82,7 +84,10 @@
 4. 실패하면 `a2-rollback`을 실행합니다.
    - 순서: pg_hba 사본 복원·reload → permanent rule 제거·reload → NM 경로 제거 → runtime 경로 제거
    - **같은 RUN의 A2 receipt**(`~/p2-hyb01-rosa-<RUN>/a2.receipt`, W0 기준선 + 단계별 INTENT/DONE)에 INTENT가 있는 변경만 되돌립니다(권욱 B3). receipt가 없거나 다른 RUN이면 같은 rule·경로·NM 경로가 있어도 지우지 않습니다. 이 RUN이 넣지 않은 항목이 있으면 자기 것만 정리하고 멈춥니다.
+   - **NM 프로필은 UUID로 고정**합니다(권욱 B3-b). a2-apply가 W0에 `conn_uuid`를 기록하고 그 UUID 프로필에만 경로를 넣습니다. a2-rollback은 그 UUID 프로필만 정리·확인합니다. 원복 때 장치에 붙은 프로필이 W0와 다르거나 조회되지 않으면 다른 프로필을 대신 쓰지 않고 `원복 완료 판정 금지`로 멈춥니다. receipt에 UUID가 없으면 아무것도 바꾸지 않습니다.
+   - **이미 원복을 마친 RUN**은 다시 지우지 않습니다(권욱 B3-a). 현재 상태가 W0와 같으면 `ALREADY_DONE`, 다르면 멈춥니다. 완료 기록을 쓰지 못하면 OK를 내지 않습니다.
    - NM·방화벽 조회 실패는 다른 항목 정리를 막지 않지만 `원복 완료 판정 금지`로 멈춥니다(권욱 B4).
+   - pg_hba 쓰기가 끝나지 않은 receipt(`INTENT hba`만 있고 `DONE hba` 없음)에서 파일이 before·after 어느 쪽과도 다르면, 쓰기 도중 잘린 파일일 수 있습니다. 이때는 **PostgreSQL reload·재시작 전에 `before` 사본으로 수동 복원**하라는 안내와 함께 멈춥니다(하영 비차단 1).
    - 마지막에 모두 absent, `MATCH=YES`, runtime rich rule 목록이 W0와 같은지 확인합니다.
    - **pg_hba SHA 가드**(infra-db#12 리뷰 비차단 1)
      - 현재 `pg_hba.conf`가 a2-apply 결과(`pg_hba.conf.after`)와 같을 때만 사본(`before`)으로 되돌립니다.
@@ -114,6 +119,9 @@ hostname·sudo·firewall-cmd·ip·nmcli·psql을 가짜로 바꿔 실행합니�
 - W0 조회 실패(권욱 B2): psql 실패·`hba_file` 불일치·NM 조회 실패·NM 영구 경로 존재면 pre-apply가 변경 0으로 멈춤, `check`는 rc0이어도 `W0_READY=NO`
 - W0 조회 실패 추가(권욱 CR 5485983590): `pg_hba_file_rules` 오류 1(매칭 줄 없음)이면 pre-apply 변경 0
 - A2 receipt(권욱 B3): receipt 없는 RUN·다른 RUN은 지우지 않음, 경로 추가 실패로 NM만 들어간 부분 적용은 NM만 원복
+- 완료 receipt(권욱 B3-a): RUN1 적용→원복 완료→RUN2 적용→RUN1 원복 재실행에서 RUN2 자원을 지우지 않고 멈춤(사전 창·A2 각각), 상태가 W0와 같으면 `ALREADY_DONE`
+- NM UUID(권욱 B3-b): 원복 때 장치 프로필이 W0와 다르면 W0 UUID 프로필 경로만 지우고 다른 프로필의 같은 경로는 보존, OK 없음
+- W3 자동 대조·부분 쓰기(하영 비차단 1·2): 사전 창 도중 pg_hba가 바뀌면 W3 STOP, 잘린 pg_hba + `DONE hba` 없음이면 수동 복원 안내와 함께 변경 0
 - NM 3값 판정(권욱 B4): 조회 실패를 "없음"으로 보지 않음 — a2-apply 변경 0, a2-rollback은 다른 항목만 정리하고 OK를 내지 않으며 NM 경로는 남음
 - pg_hba 매칭 허용 줄 검사: `0.0.0.0/0`·`10.0.0.0/8`·`samenet` 줄이 있으면 pre-apply·a2-apply가 변경 0으로 멈추거나 `check`가 목록으로 보고, reject 줄은 제외
 - a2-rollback SHA 가드: a2-apply 뒤 pg_hba가 바뀌었으면 덮어쓰지 않고 변경 0으로 멈춤, 이미 원복됐으면 복원 건너뜀

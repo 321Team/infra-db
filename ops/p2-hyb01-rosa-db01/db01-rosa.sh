@@ -89,6 +89,8 @@ gw_dev() { ip -4 -o route get "$GW" | sed -n 's/.* dev \([^ ]*\).*/\1/p'; }
 gw_onlink() { local r; r=$(ip -4 -o route get "$GW") || return 2; case "$r" in *" via "*) return 1 ;; esac; return 0; }
 via_gw() { local r; r=$(ip -4 -o route get "$PROBE") || return 2; case "$r" in *" via $GW "*) return 0 ;; esac; return 1; }
 nm_conn() { local d; d=$(gw_dev) && test -n "$d" && nmcli -g GENERAL.CONNECTION device show "$d"; }
+# NM 프로필은 이름이 아니라 UUID로 고정한다. 이름 변경·동명 재생성·다른 프로필로 바뀐 경우를 구분한다(권욱 B3-b).
+nm_uuid() { local d; d=$(gw_dev) && test -n "$d" && nmcli -g GENERAL.CON-UUID device show "$d"; }
 nm_routes() { nmcli -g ipv4.routes connection show "$1"; }
 # 0=있음, 1=없음, 2=조회 실패. 호출하는 쪽은 `!`로 뒤집지 말고 세 값을 나눠 판정한다(infra-db#12 권욱 B4).
 nm_has() {
@@ -98,6 +100,11 @@ nm_has() {
 nm_state() { test -n "$1" || { echo CONN_UNKNOWN; return; }; local r=0; nm_has "$1" || r=$?; case $r in 0) echo present ;; 1) echo absent ;; *) echo QUERY_ERROR ;; esac; }
 # runtime rich rule 목록(정렬) 해시. W0와 원복 뒤를 비교한다. 조회 실패면 rc≠0.
 fw_rules_sha() { local r; r=$(sudo firewall-cmd --zone="$ZONE" --list-rich-rules) || return 2; printf '%s\n' "$r" | sort | sha256sum | cut -c1-64; }
+# W3(인증 계층 불변) 자동 대조용: pg_hba 파일 해시와 pg_hba_file_rules 원문 해시(하영 비차단 2). 조회 실패면 rc≠0.
+hba_file_sha() { local r; r=$(sudo sha256sum "$HBA") || return 2; printf '%s' "${r%% *}"; }
+hba_rules_sha() { local r; r=$(hba_rules) || return 2; test -n "$r" || return 2; printf '%s\n' "$r" | sha256sum | cut -c1-64; }
+# receipt W0 줄에서 key=값 하나를 읽는다(값에 공백 없음).
+w0_get() { sed -n "s/^W0 .* $2=\([^ ]*\).*/\1/p" "$1"; }
 
 hba_errors() { pg -c "SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL"; }
 hba_new_rows() { pg -c "SELECT count(*) FROM pg_hba_file_rules WHERE address = '10.20.10.0' AND netmask = '255.255.255.0'"; }
@@ -129,8 +136,8 @@ show() {
   echo "-- 복귀 경로 $TUN: runtime=$(route_state)"
   echo "-- ip route get $PROBE: $(ip -4 -o route get "$PROBE" 2>&1)"
   echo "-- ip route get $GW: $(ip -4 -o route get "$GW" 2>&1) (on-link=$(gw_onlink && echo YES || echo NO))"
-  local c; c=$(nm_conn) || c=""
-  echo "-- NM connection(dev $(gw_dev))=[$c] ipv4.routes=[$(test -n "$c" && nm_routes "$c")] 영구 경로=$(nm_state "$c")"
+  local c u; c=$(nm_conn) || c=""; u=$(nm_uuid) || u=""
+  echo "-- NM connection(dev $(gw_dev))=[$c] uuid=[$u] ipv4.routes=[$(test -n "$u" && nm_routes "$u")] 영구 경로=$(nm_state "$u")"
   echo "-- runtime rich rule 목록 sha256: $(fw_rules_sha || echo QUERY_ERROR)"
   if test -f "$RCPT"; then
     local t0; t0=$(sed -n 's/^W0 \([0-9]*\) .*/\1/p' "$RCPT")
@@ -170,9 +177,11 @@ pre_guard() {
   test -z "$v" || { echo "10.20.10.x에 매칭되는 pg_hba 허용 줄이 이미 있음(위 목록) — 인증 경로가 열린 상태"; return 1; }
   v=$(hba_rules) && test -n "$v" || { echo "pg_hba_file_rules 원문 조회 실패"; return 1; }
   v=$(conn_headroom) && test -n "$v" || { echo "연결 여유 조회 실패"; return 1; }
-  c=$(nm_conn) && test -n "$c" || { echo "NM connection 조회 실패"; return 1; }
+  c=$(nm_uuid) && test -n "$c" || { echo "NM connection UUID 조회 실패"; return 1; }
   case "$(nm_state "$c")" in absent) ;; present) echo "NM 영구 경로가 이미 있음"; return 1 ;; *) echo "NM 영구 경로 조회 실패"; return 1 ;; esac
   v=$(fw_rules_sha) && test -n "$v" || { echo "runtime rich rule 목록 조회 실패"; return 1; }
+  v=$(hba_file_sha) && test -n "$v" || { echo "pg_hba 파일 해시 조회 실패"; return 1; }
+  v=$(hba_rules_sha) && test -n "$v" || { echo "pg_hba_file_rules 해시 조회 실패"; return 1; }
   return 0
 }
 # 사전 조건: 매칭 허용 줄이 없어야 한다. 조회 실패도 멈춘다.
@@ -201,9 +210,10 @@ case "$MODE" in
     show
     r=$(pre_guard) || die "$r. 변경하지 않았다"
     W0_RULES=$(fw_rules_sha) || die "runtime rich rule 목록 조회 실패. 변경하지 않았다"
+    W0_HBA=$(hba_file_sha) && W0_HRULES=$(hba_rules_sha) || die "pg_hba 해시 조회 실패. 변경하지 않았다"
     T0=$(date +%s)
     # W0 기준선. 이 줄을 못 쓰면 원복 근거가 없으므로 쓰기 전에 멈춘다.
-    echo "W0 $T0 $(date '+%F %T') rule_rt=absent rule_perm=absent route=absent match=YES rules_sha=$W0_RULES" > "$RCPT" \
+    echo "W0 $T0 $(date '+%F %T') rule_rt=absent rule_perm=absent route=absent match=YES rules_sha=$W0_RULES hba_sha=$W0_HBA hba_rules_sha=$W0_HRULES" > "$RCPT" \
       || die "receipt 기록 실패. 변경하지 않았다"
     echo "-- W1 $(date -d "@$T0" '+%T') / 마지막 시험 시작 ≤ $(date -d "@$((T0 + 90*60))" '+%T') / W4 시작 ≤ $(date -d "@$((T0 + 100*60))" '+%T') / 완료 상한 $(date -d "@$((T0 + 120*60))" '+%T') — 자동 만료 아님, 카드대로 pre-rollback"
     echo "INTENT rule" >> "$RCPT" || die "receipt 기록 실패. 변경하지 않았다"
@@ -224,7 +234,17 @@ case "$MODE" in
     # 이 RUN이 기록한 변경만 되돌린다. receipt가 없으면 아무것도 지우지 않는다(B3).
     test -f "$RCPT" && grep -q '^W0 ' "$RCPT" \
       || die "이 RUN($RUN)의 pre-apply receipt가 없음 — 이 RUN이 넣은 변경이 아니므로 지우지 않았다. 수동 판단"
-    W0_RULES=$(sed -n 's/^W0 .* rules_sha=\([0-9a-f]*\).*/\1/p' "$RCPT")
+    W0_RULES=$(w0_get "$RCPT" rules_sha)
+    # 원복을 마친 RUN의 receipt는 다시 삭제 근거가 되지 못한다. 읽기만 하고 W0와 같으면 끝, 다르면 멈춘다(권욱 B3-a).
+    if grep -q '^DONE rollback ' "$RCPT"; then
+      NOW_RULES=$(fw_rules_sha) || NOW_RULES=QUERY_ERROR
+      if test "$(fw_state)" = absent && test "$(fw_state --permanent)" = absent && test "$(route_state)" = absent \
+         && test -n "$W0_RULES" && test "$NOW_RULES" = "$W0_RULES"; then
+        echo "RESULT pre-rollback=ALREADY_DONE $(date '+%T') — 이미 원복한 RUN. 변경 0, 현재 상태 W0와 같음"
+        exit 0
+      fi
+      die "이미 원복한 RUN($RUN)이고 현재 상태가 W0와 다름(다른 RUN의 변경일 수 있음) — 지우지 않았다. 수동 판단"
+    fi
     FOREIGN=""
     # 1) rule: INTENT가 있으면 이 RUN 소유. 조회 실패는 원복 완료 판정을 막는다.
     ST=$(fw_state)
@@ -257,8 +277,13 @@ case "$MODE" in
     # runtime=permanent만으로 W0 복원이라 단정하지 않는다. W0 runtime rich rule 목록과 같아야 한다.
     NOW_RULES=$(fw_rules_sha) || die "runtime rich rule 목록 조회 실패 — 원복 완료 판정 금지"
     test -n "$W0_RULES" && test "$NOW_RULES" = "$W0_RULES" || die "runtime rich rule 목록이 W0와 다름(W0=${W0_RULES:-없음} 현재=$NOW_RULES) — 수동 대조"
-    echo "DONE rollback $(date +%s) $(date '+%F %T')" >> "$RCPT"
-    echo "RESULT pre-rollback=OK $(date '+%T') — W0 대조 일치"
+    # W3: 사전 창은 pg_hba를 바꾸지 않는다. 파일·로드된 규칙 해시가 W0와 같아야 한다(하영 비차단 2).
+    W0_HBA=$(w0_get "$RCPT" hba_sha); W0_HRULES=$(w0_get "$RCPT" hba_rules_sha)
+    NOW_HBA=$(hba_file_sha) && NOW_HRULES=$(hba_rules_sha) || die "W3 pg_hba 해시 조회 실패 — 원복 완료 판정 금지"
+    test -n "$W0_HBA" && test "$NOW_HBA" = "$W0_HBA" && test "$NOW_HRULES" = "$W0_HRULES" \
+      || die "W3: pg_hba 파일 또는 pg_hba_file_rules가 W0와 다름 — 수동 대조(이 RUN의 rule·경로는 정리함)"
+    echo "DONE rollback $(date +%s) $(date '+%F %T')" >> "$RCPT" || die "원복 완료 기록 실패 — OK로 보고하지 않는다. 수동 판단"
+    echo "RESULT pre-rollback=OK $(date '+%T') — W0·W3 대조 일치"
     ;;
 
   a2-apply)
@@ -272,7 +297,8 @@ case "$MODE" in
     test "$(route_state)" = absent || die "runtime 복귀 경로가 이미 있음. 변경하지 않았다"
     gw_onlink || die "$GW가 직접 연결 경로가 아님. 변경하지 않았다"
     CONN=$(nm_conn) && test -n "$CONN" || die "$GW 경로의 NM connection을 찾지 못함. 변경하지 않았다"
-    case "$(nm_state "$CONN")" in
+    CONN_UUID=$(nm_uuid) && test -n "$CONN_UUID" || die "$GW 경로의 NM connection UUID를 찾지 못함. 변경하지 않았다"
+    case "$(nm_state "$CONN_UUID")" in
       absent) ;;
       present) die "NM 영구 경로가 이미 있음. 변경하지 않았다" ;;
       *) die "NM 영구 경로 조회 실패. 변경하지 않았다" ;;
@@ -295,15 +321,15 @@ case "$MODE" in
     IF_BEFORE=$(rt_ifaces)
     W0_RULES=$(fw_rules_sha) && test -n "$W0_RULES" || die "runtime rich rule 목록 조회 실패. 변경하지 않았다"
     # W0 기준선. 이 줄을 못 쓰면 원복 근거가 없으므로 서버 변경 전에 멈춘다.
-    echo "W0 $(date +%s) $(date '+%F %T') rule_rt=absent rule_perm=absent route=absent nm=absent hba_rows=0 match=YES rules_sha=$W0_RULES conn=$CONN" > "$A2R" \
+    echo "W0 $(date +%s) $(date '+%F %T') rule_rt=absent rule_perm=absent route=absent nm=absent hba_rows=0 match=YES rules_sha=$W0_RULES conn_uuid=$CONN_UUID conn=$CONN" > "$A2R" \
       || die "A2 receipt 기록 실패. 변경하지 않았다"
 
     # 1) 복귀 경로: NM 영구 설정(재부팅 대비) + runtime. connection을 다시 올리지 않는다(기존 연결 끊김 방지).
-    nm_routes "$CONN" > "$LOGDIR/nm-routes.before"
+    nm_routes "$CONN_UUID" > "$LOGDIR/nm-routes.before"
     echo "INTENT nm" >> "$A2R" || die "A2 receipt 기록 실패. 변경하지 않았다"
-    sudo nmcli connection modify "$CONN" +ipv4.routes "$TUN $GW" || die "NM 영구 경로 추가 실패 → a2-rollback $RUN"
+    sudo nmcli connection modify "$CONN_UUID" +ipv4.routes "$TUN $GW" || die "NM 영구 경로 추가 실패 → a2-rollback $RUN"
     echo "DONE nm" >> "$A2R"
-    nm_has "$CONN" || die "NM 영구 경로 readback 실패 → a2-rollback $RUN"
+    nm_has "$CONN_UUID" || die "NM 영구 경로 readback 실패 → a2-rollback $RUN"
     echo "INTENT route" >> "$A2R" || die "A2 receipt 기록 실패 → a2-rollback $RUN"
     sudo ip route add "$TUN" via "$GW" || die "runtime 경로 추가 실패 → a2-rollback $RUN"
     echo "DONE route" >> "$A2R"
@@ -342,7 +368,21 @@ case "$MODE" in
     # receipt가 없으면 아무것도 지우지 않는다. 조회 실패는 계속 정리하되 완료 판정을 막는다(B4).
     test -f "$A2R" && grep -q '^W0 ' "$A2R" \
       || die "이 RUN($RUN)의 a2-apply receipt가 없음 — 이 RUN이 넣은 변경이 아니므로 지우지 않았다. 수동 판단"
-    W0_RULES=$(sed -n 's/^W0 .* rules_sha=\([0-9a-f]*\).*/\1/p' "$A2R")
+    W0_RULES=$(w0_get "$A2R" rules_sha)
+    # 원복 대상 NM 프로필은 W0에 기록한 UUID다. 없으면 receipt를 믿을 수 없으므로 아무것도 바꾸지 않는다(권욱 B3-b).
+    R_UUID=$(w0_get "$A2R" conn_uuid)
+    test -n "$R_UUID" || die "A2 receipt에 NM 프로필 UUID가 없음 — 변경하지 않았다. 수동 판단"
+    # 원복을 마친 RUN의 receipt는 다시 삭제 근거가 되지 못한다(권욱 B3-a).
+    if grep -q '^DONE rollback ' "$A2R"; then
+      NOW_RULES=$(fw_rules_sha) || NOW_RULES=QUERY_ERROR
+      if test "$(fw_state)" = absent && test "$(fw_state --permanent)" = absent && test "$(route_state)" = absent \
+         && test "$(nm_state "$R_UUID")" = absent && test "$(hba_new_rows)" = 0 \
+         && test -n "$W0_RULES" && test "$NOW_RULES" = "$W0_RULES"; then
+        echo "RESULT a2-rollback=ALREADY_DONE $(date '+%T') — 이미 원복한 RUN. 변경 0, 현재 상태 W0와 같음"
+        exit 0
+      fi
+      die "이미 원복한 RUN($RUN)이고 현재 상태가 W0와 다름(다른 RUN의 변경일 수 있음) — 지우지 않았다. 수동 판단"
+    fi
     owned() { grep -qx "INTENT $1" "$A2R"; }
     FOREIGN=""; QERR=""
     if owned hba && sudo -u postgres test -f "$SEC/pg_hba.conf.before"; then
@@ -359,6 +399,9 @@ case "$MODE" in
         sudo -u postgres sh -c 'cat "$1" > "$2"' sh "$SEC/pg_hba.conf.before" "$HBA" || die "pg_hba.conf 복원 실패"
         reload_pg
       else
+        if ! grep -qx 'DONE hba' "$A2R"; then
+          die "현재 pg_hba가 before·after 어느 쪽과도 다르고 이 RUN의 pg_hba 쓰기가 끝나지 않음 — 쓰기 도중 잘린 파일일 수 있다. PostgreSQL reload·재시작 전에 $SEC/pg_hba.conf.before 로 수동 복원하고 판단(방화벽·경로는 아직 그대로)"
+        fi
         die "현재 pg_hba가 a2-apply 결과(after)·이전(before) 어느 쪽과도 다름 — 다른 변경이 있었을 수 있어 덮어쓰지 않는다. 수동 판단(방화벽·경로는 아직 그대로)"
       fi
     elif owned hba; then
@@ -384,13 +427,15 @@ case "$MODE" in
       test "$ST" = absent && test "$(fw_state)" = absent || FOREIGN="$FOREIGN rule"
     fi
     # NM 영구 경로. 조회 실패(2)를 "없음"으로 보지 않는다(B4).
-    CONN=$(nm_conn) || CONN=""
-    ST=$(nm_state "$CONN")
+    # 대상은 W0의 UUID 프로필뿐이다. 지금 장치에 붙은 프로필이 다르면 그 프로필은 건드리지 않고 완료 판정을 막는다.
+    CUR_UUID=$(nm_uuid) || CUR_UUID=""
+    test "$CUR_UUID" = "$R_UUID" || { echo "-- NM 프로필이 W0와 다름(W0=$R_UUID 현재=${CUR_UUID:-조회 실패}) — W0 프로필만 정리하고 판정에서 멈춘다"; QERR="$QERR nm-profile-changed"; }
+    ST=$(nm_state "$R_UUID")
     if owned nm; then
       case "$ST" in
-        present) sudo nmcli connection modify "$CONN" -ipv4.routes "$TUN $GW" || QERR="$QERR nm-remove" ;;
+        present) sudo nmcli connection modify "$R_UUID" -ipv4.routes "$TUN $GW" || QERR="$QERR nm-remove" ;;
         absent) ;;
-        *) echo "-- NM 영구 경로 확인 불가(connection=[$CONN]) — 다른 항목만 정리하고 판정에서 멈춘다"; QERR="$QERR nm-query" ;;
+        *) echo "-- NM 영구 경로 확인 불가(uuid=[$R_UUID]) — 다른 항목만 정리하고 판정에서 멈춘다"; QERR="$QERR nm-query" ;;
       esac
     else
       test "$ST" = absent || FOREIGN="$FOREIGN nm($ST)"
@@ -413,8 +458,7 @@ case "$MODE" in
     test "$(hba_new_rows)" = 0 && test "$(hba_errors)" = 0 || die "원복 뒤 pg_hba에 $SRC 규칙이나 오류가 남음"
     test "$(fw_state)" = absent && test "$(fw_state --permanent)" = absent || die "원복 뒤 rich rule이 남음"
     test "$(route_state)" = absent || die "원복 뒤 runtime 경로가 남음"
-    test -n "$CONN" || die "NM connection 미확인: 원복 완료 판정 금지"
-    case "$(nm_state "$CONN")" in
+    case "$(nm_state "$R_UUID")" in
       absent) ;;
       present) die "원복 뒤 NM 영구 경로가 남음" ;;
       *) die "NM 영구 경로 조회 실패: 원복 완료 판정 금지" ;;
@@ -422,7 +466,7 @@ case "$MODE" in
     test "$(fw_match)" = YES || die "원복 뒤 MATCH가 YES가 아님 — W0 기록과 대조"
     NOW_RULES=$(fw_rules_sha) || die "runtime rich rule 목록 조회 실패 — 원복 완료 판정 금지"
     test -n "$W0_RULES" && test "$NOW_RULES" = "$W0_RULES" || die "runtime rich rule 목록이 W0와 다름 — 수동 대조"
-    echo "DONE rollback $(date +%s) $(date '+%F %T')" >> "$A2R"
+    echo "DONE rollback $(date +%s) $(date '+%F %T')" >> "$A2R" || die "원복 완료 기록 실패 — OK로 보고하지 않는다. 수동 판단"
     echo "RESULT a2-rollback=OK $(date '+%T') — W0 대조 일치"
     ;;
 

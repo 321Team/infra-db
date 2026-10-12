@@ -51,12 +51,17 @@ exit 0
 X
 cat > "$T/bin/nmcli" <<'X'
 #!/usr/bin/env bash
-d=$FAKE_DIR
-case "$*" in
-  *"device show ens160"*) echo "ens160"; exit 0 ;;
-  *"connection show ens160"*) test -n "${FAKE_NM_FAIL:-}" && { echo "Error: NetworkManager is not running." >&2; exit 8; }; cat "$d/nm" 2>/dev/null; exit 0 ;;
-  *"connection modify ens160 +ipv4.routes"*) echo "nm add" >> "$d/mut"; echo "10.20.0.0/16 10.1.93.51" > "$d/nm"; exit 0 ;;
-  *"connection modify ens160 -ipv4.routes"*) echo "nm del" >> "$d/mut"; : > "$d/nm"; exit 0 ;;
+# 프로필별 ipv4.routes 파일: 원래 프로필(이름 ens160, UUID uuid-ens160)은 FAKE_DIR/nm, 다른 프로필 P는 FAKE_DIR/nm.P.
+# FAKE_CUR_CONN·FAKE_CUR_UUID: 장치 ens160에 지금 붙은 프로필(권욱 B3-b 프로필 변경 시험). FAKE_NM_FAIL: routes 조회 실패.
+d=$FAKE_DIR; args="$*"
+pf() { case "$1" in ens160|uuid-ens160) echo "$d/nm" ;; *) echo "$d/nm.$1" ;; esac; }
+prof() { local p=${args#*connection "$1" }; echo "${p%% *}"; }
+case "$args" in
+  *"GENERAL.CON-UUID device show ens160"*) echo "${FAKE_CUR_UUID:-uuid-ens160}"; exit 0 ;;
+  *"GENERAL.CONNECTION device show ens160"*) echo "${FAKE_CUR_CONN:-ens160}"; exit 0 ;;
+  *"connection show "*) test -n "${FAKE_NM_FAIL:-}" && { echo "Error: NetworkManager is not running." >&2; exit 8; }; cat "$(pf "$(prof show)")" 2>/dev/null; exit 0 ;;
+  *"connection modify "*" +ipv4.routes"*) echo "nm add" >> "$d/mut"; echo "10.20.0.0/16 10.1.93.51" > "$(pf "$(prof modify)")"; exit 0 ;;
+  *"connection modify "*" -ipv4.routes"*) echo "nm del" >> "$d/mut"; : > "$(pf "$(prof modify)")"; exit 0 ;;
 esac
 exit 1
 X
@@ -134,9 +139,20 @@ P=$LAST_DIR; rm -f "$P/mut"
 grep -q '^W0 .*rules_sha=' "$P/home/p2-hyb01-rosa-20261021T1000/pre.receipt" && grep -qx 'DONE route' "$P/home/p2-hyb01-rosa-20261021T1000/pre.receipt" \
   && echo "PASS pre-apply: receipt에 W0·INTENT/DONE" || { echo "FAIL pre-apply: receipt"; FAILS=$((FAILS + 1)); }
 KEEP_DIR=$P run "pre-apply: 같은 RUN 재적용 거부(receipt 있음)" pre-apply 3 'receipt가 이미 있음' ""
-KEEP_DIR=$P run "pre-rollback: 같은 RUN receipt대로 원복, W0 대조" pre-rollback 0 'RESULT pre-rollback=OK .* W0 대조 일치' "remove rt,route del"
+KEEP_DIR=$P run "pre-rollback: 같은 RUN receipt대로 원복, W0 대조" pre-rollback 0 'RESULT pre-rollback=OK .* W0·W3 대조 일치' "remove rt,route del"
 rm -f "$P/mut"
-KEEP_DIR=$P run "pre-rollback: 원복 뒤 재실행은 건너뛰기만(변경 0)" pre-rollback 0 'RESULT pre-rollback=OK' ""
+KEEP_DIR=$P run "pre-rollback: 원복 뒤 재실행은 읽기만(ALREADY_DONE, 변경 0)" pre-rollback 0 'RESULT pre-rollback=ALREADY_DONE' ""
+# B3-a — 원복을 마친 RUN1의 receipt로 뒤이은 RUN2의 rule·경로를 지우지 않는다(권욱 재현 순서 그대로).
+rm -f "$P/mut"
+RUNID=20261021T1100 KEEP_DIR=$P run "pre-apply: RUN1 완료 뒤 RUN2 적용" pre-apply 0 'RESULT pre-apply=OK' "add rt,route add"
+rm -f "$P/mut"
+KEEP_DIR=$P run "pre-rollback: 완료된 RUN1 재실행 → RUN2 자원 보존, STOP" pre-rollback 3 '이미 원복한 RUN' ""
+test -f "$P/route" && grep -qxF "$RULE" "$P/rt" && echo "PASS B3-a: RUN2 rule·경로 그대로" || { echo "FAIL B3-a: RUN2 자원 삭제됨"; FAILS=$((FAILS + 1)); }
+# W3 자동 대조(하영 비차단 2): 사전 창 도중 pg_hba가 바뀌면 자기 rule·경로는 정리하되 OK를 내지 않는다.
+run "pre-apply(W3 시험 준비)" pre-apply 0 'RESULT pre-apply=OK' "add rt,route add"
+W3=$LAST_DIR; rm -f "$W3/mut"
+echo 'host all all 10.9.9.9/32 reject' >> "$W3/root/var/lib/pgsql/data/pg_hba.conf"
+KEEP_DIR=$W3 run "pre-rollback: pg_hba가 W0와 다르면 W3 STOP" pre-rollback 3 'W3' "remove rt,route del"
 
 # B3 — receipt 없는 RUN, 다른 RUN, 이 RUN이 넣지 않은 항목은 지우지 않는다.
 EXTRA_RT=$RULE ROUTE=1 run "pre-rollback: receipt 없음 + 같은 rule·경로가 있음 → 지우지 않음" pre-rollback 3 'receipt가 없음' ""
@@ -205,7 +221,27 @@ cmp -s "$T/hba" "$A2/root/var/lib/pgsql/data/pg_hba.conf" && echo "PASS a2-rollb
 rm -f "$A2/mut"
 KEEP_DIR=$A2 run "a2-apply: 같은 RUN 재적용 거부(receipt 있음)" a2-apply 3 'A2 receipt가 이미 있음' ""
 rm -f "$A2/mut"
-KEEP_DIR=$A2 run "a2-rollback: 이미 원복된 뒤 재실행은 복원 건너뜀(변경 0)" a2-rollback 0 '이미 before와 같음' ""
+KEEP_DIR=$A2 run "a2-rollback: 이미 원복된 뒤 재실행은 읽기만(ALREADY_DONE, 변경 0)" a2-rollback 0 'RESULT a2-rollback=ALREADY_DONE' ""
+# B3-a(A2) — 완료된 RUN1 receipt로 RUN2의 A2 변경을 지우지 않는다.
+rm -f "$A2/mut"
+RUNID=20261021T1100 KEEP_DIR=$A2 run "a2-apply: RUN1 완료 뒤 RUN2 적용" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
+cp "$A2/root/var/lib/pgsql/data/pg_hba.conf" "$A2/hba.run2"; rm -f "$A2/mut"
+KEEP_DIR=$A2 run "a2-rollback: 완료된 RUN1 재실행 → RUN2 자원 보존, STOP" a2-rollback 3 '이미 원복한 RUN' ""
+test -s "$A2/nm" && test -f "$A2/route" && grep -qxF "$RULE" "$A2/perm" && cmp -s "$A2/hba.run2" "$A2/root/var/lib/pgsql/data/pg_hba.conf" \
+  && echo "PASS B3-a(A2): RUN2 NM·경로·rule·pg_hba 그대로" || { echo "FAIL B3-a(A2): RUN2 자원 변경됨"; FAILS=$((FAILS + 1)); }
+# B3-b — 원복 때 장치의 프로필이 W0와 다르면 W0 UUID 프로필만 정리하고 OK를 내지 않는다. 다른 프로필의 같은 경로는 보존.
+run "a2-apply(프로필 변경 시험 준비)" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
+PB=$LAST_DIR; rm -f "$PB/mut"
+echo "10.20.0.0/16 10.1.93.51" > "$PB/nm.uuid-replacement"
+FAKE_CUR_CONN=replacement FAKE_CUR_UUID=uuid-replacement KEEP_DIR=$PB run "a2-rollback: 프로필이 W0와 다름 → OK 없음" a2-rollback 3 'nm-profile-changed' "remove perm,reload,nm del,route del"
+test ! -s "$PB/nm" && test -s "$PB/nm.uuid-replacement" && echo "PASS B3-b: W0 프로필 경로만 삭제, 다른 프로필 경로 보존" || { echo "FAIL B3-b: 프로필 처리"; FAILS=$((FAILS + 1)); }
+grep -q '^W0 .* conn_uuid=uuid-ens160 ' "$PB/home/p2-hyb01-rosa-20261021T1000/a2.receipt" && echo "PASS B3-b: receipt에 W0 UUID 기록" || { echo "FAIL B3-b: receipt UUID"; FAILS=$((FAILS + 1)); }
+# 하영 비차단 1 — pg_hba 쓰기가 끝나지 않은 receipt에서 파일이 before·after 어느 쪽과도 다르면 수동 복원 안내와 함께 멈춘다.
+run "a2-apply(부분 쓰기 시험 준비)" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
+PW=$LAST_DIR; rm -f "$PW/mut"
+sed -i '/^DONE hba$/d' "$PW/home/p2-hyb01-rosa-20261021T1000/a2.receipt"
+head -2 "$PW/root/var/lib/pgsql/data/pg_hba.conf" > "$PW/hba.cut"; cp "$PW/hba.cut" "$PW/root/var/lib/pgsql/data/pg_hba.conf"
+KEEP_DIR=$PW run "a2-rollback: 잘린 pg_hba + DONE hba 없음 → 수동 복원 안내, 변경 0" a2-rollback 3 '잘린 파일일 수 있다' ""
 
 # a2-apply 뒤 다른 승인된 pg_hba 변경이 생긴 경우: 덮어쓰지 않고 방화벽·경로도 건드리지 않고 멈춘다(SHA 가드).
 run "a2-apply(가드 시험 준비)" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
