@@ -85,6 +85,7 @@ case "$*" in
   *"auth_method <> 'reject'"*) broad ;;
   *max_connections*) echo "max_connections=100 superuser_reserved=3 sessions=7 authentication_timeout=1min" ;;
   *"address = '10.20.10.0'"*) rules | grep -cF '|10.20.10.0|255.255.255.0|' ;;
+  *"error IS NOT NULL"*) echo "${FAKE_HBA_ERRORS:-0}" ;;
   *count*) echo 0 ;;
   *pg_reload_conf*) echo t ;;
   *pg_hba_file_rules*) rules ;;
@@ -169,6 +170,7 @@ grep -qF '10.9.9.9/32' "$R4/rt" && echo "PASS pre-rollback 동시 변경: 다른
 # B2 — W0 필수 조회가 실패하면 첫 쓰기 전에 멈춘다.
 FAKE_PG_FAIL=1 run "pre-apply: psql 조회 실패 → 변경 0" pre-apply 3 'STOP' ""
 FAKE_HBA_FILE=/other/pg_hba.conf run "pre-apply: hba_file 불일치 → 변경 0" pre-apply 3 'hba_file' ""
+FAKE_HBA_ERRORS=1 run "pre-apply: pg_hba 오류 1(매칭 줄 없음) → 변경 0" pre-apply 3 'pg_hba_file_rules 오류' ""
 FAKE_NM_FAIL=1 run "pre-apply: NM 조회 실패 → 변경 0" pre-apply 3 'NM 영구 경로 조회 실패' ""
 NMROUTE=1 run "pre-apply: NM 영구 경로가 이미 있음 → 변경 0" pre-apply 3 'NM 영구 경로가 이미 있음' ""
 FAKE_PG_FAIL=1 run "check: 조회 실패면 rc0이어도 W0_READY=NO" check 0 'W0_READY(pre-apply)=NO' ""
@@ -179,9 +181,19 @@ EXTRA_PERM=$RULE run "a2-apply: permanent rule이 이미 있음 → 변경 0" a2
 NMROUTE=1 run "a2-apply: NM 영구 경로가 이미 있음 → 변경 0" a2-apply 3 'NM 영구 경로가 이미 있음' ""
 # B4 — NM 조회 실패(2)를 "없음"으로 보지 않는다.
 FAKE_NM_FAIL=1 run "a2-apply: NM 조회 실패 → 변경 0" a2-apply 3 'NM 영구 경로 조회 실패' ""
-FAKE_NM_FAIL=1 EXTRA_RT=$RULE EXTRA_PERM=$RULE ROUTE=1 NMROUTE=1 run "a2-rollback: NM 조회 실패면 runtime만 정리하고 OK를 내지 않음" a2-rollback 3 '원복 완료 판정 금지' "remove perm,reload,route del"
-test -s "$LAST_DIR/nm" && echo "PASS a2-rollback NM 조회 실패: NM 경로는 남아 있고 OK 아님" || { echo "FAIL a2-rollback NM 조회 실패"; FAILS=$((FAILS + 1)); }
-EXTRA_RT=$RULE EXTRA_PERM=$RULE ROUTE=1 NMROUTE=1 run "a2-rollback: 방화벽·경로 원복(pg_hba 사본 없음)" a2-rollback 0 'RESULT a2-rollback=OK' "remove perm,reload,nm del,route del"
+# B3(A2) — a2-rollback도 같은 RUN receipt의 INTENT 항목만 되돌린다.
+EXTRA_RT=$RULE EXTRA_PERM=$RULE ROUTE=1 NMROUTE=1 run "a2-rollback: receipt 없음 + 같은 rule·경로·NM → 지우지 않음" a2-rollback 3 'receipt가 없음' ""
+run "a2-apply(다른 RUN 시험 준비)" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
+M=$LAST_DIR; rm -f "$M/mut"
+RUNID=20261021T1100 KEEP_DIR=$M run "a2-rollback: 다른 RUN으로는 지우지 않음" a2-rollback 3 'receipt가 없음' ""
+FAKE_ROUTE_ADD_FAIL=1 run "a2-apply: runtime 경로 추가 실패 → STOP(NM만 추가된 상태)" a2-apply 3 '경로 추가 실패' "nm add,route add"
+PA=$LAST_DIR; rm -f "$PA/mut"
+KEEP_DIR=$PA run "a2-rollback: 부분 적용 — 이 RUN이 넣은 NM만 원복" a2-rollback 0 'RESULT a2-rollback=OK' "nm del"
+# B4 — a2-apply 뒤 NM 조회 실패: 다른 항목은 정리하되 OK를 내지 않고 NM 경로는 남는다.
+run "a2-apply(NM 조회 실패 원복 시험 준비)" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
+N=$LAST_DIR; rm -f "$N/mut"
+FAKE_NM_FAIL=1 KEEP_DIR=$N run "a2-rollback: NM 조회 실패면 나머지만 정리하고 OK를 내지 않음" a2-rollback 3 '원복 완료 판정 금지' "remove perm,reload,route del"
+test -s "$N/nm" && echo "PASS a2-rollback NM 조회 실패: NM 경로는 남아 있고 OK 아님" || { echo "FAIL a2-rollback NM 조회 실패"; FAILS=$((FAILS + 1)); }
 # a2-apply 정상 경로 → 같은 상태에서 a2-rollback
 run "a2-apply: NM·runtime 경로 → permanent rule·reload → pg_hba 1줄" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
 A2=$LAST_DIR
@@ -191,7 +203,7 @@ rm -f "$A2/mut"
 KEEP_DIR=$A2 run "a2-rollback: a2-apply 뒤 전체 원복" a2-rollback 0 'RESULT a2-rollback=OK' "remove perm,reload,nm del,route del"
 cmp -s "$T/hba" "$A2/root/var/lib/pgsql/data/pg_hba.conf" && echo "PASS a2-rollback: pg_hba 원본과 같음" || { echo "FAIL a2-rollback: pg_hba 다름"; FAILS=$((FAILS + 1)); }
 rm -f "$A2/mut"
-KEEP_DIR=$A2 run "a2-apply: 같은 RUN 재적용 거부(사본 있음)" a2-apply 3 '이전 사본이 이미 있음' ""
+KEEP_DIR=$A2 run "a2-apply: 같은 RUN 재적용 거부(receipt 있음)" a2-apply 3 'A2 receipt가 이미 있음' ""
 rm -f "$A2/mut"
 KEEP_DIR=$A2 run "a2-rollback: 이미 원복된 뒤 재실행은 복원 건너뜀(변경 0)" a2-rollback 0 '이미 before와 같음' ""
 

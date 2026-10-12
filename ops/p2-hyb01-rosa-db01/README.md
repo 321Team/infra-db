@@ -81,7 +81,9 @@
 3. A3·A4는 fds-msa 전환 계약과 [#43 ROSA 전달 계약](https://github.com/321Team/fds-msa/pull/31)을 따릅니다. 판정은 실제 거래 저장·조회입니다.
 4. 실패하면 `a2-rollback`을 실행합니다.
    - 순서: pg_hba 사본 복원·reload → permanent rule 제거·reload → NM 경로 제거 → runtime 경로 제거
-   - 마지막에 모두 absent이고 `MATCH=YES`인지 확인합니다.
+   - **같은 RUN의 A2 receipt**(`~/p2-hyb01-rosa-<RUN>/a2.receipt`, W0 기준선 + 단계별 INTENT/DONE)에 INTENT가 있는 변경만 되돌립니다(권욱 B3). receipt가 없거나 다른 RUN이면 같은 rule·경로·NM 경로가 있어도 지우지 않습니다. 이 RUN이 넣지 않은 항목이 있으면 자기 것만 정리하고 멈춥니다.
+   - NM·방화벽 조회 실패는 다른 항목 정리를 막지 않지만 `원복 완료 판정 금지`로 멈춥니다(권욱 B4).
+   - 마지막에 모두 absent, `MATCH=YES`, runtime rich rule 목록이 W0와 같은지 확인합니다.
    - **pg_hba SHA 가드**(infra-db#12 리뷰 비차단 1)
      - 현재 `pg_hba.conf`가 a2-apply 결과(`pg_hba.conf.after`)와 같을 때만 사본(`before`)으로 되돌립니다.
      - 이미 `before`와 같으면 복원을 건너뜁니다.
@@ -110,7 +112,9 @@ hostname·sudo·firewall-cmd·ip·nmcli·psql을 가짜로 바꿔 실행합니�
 - 모드별 변경 목록과 순서
 - 사전 창 receipt(권욱 B1·B3): 같은 RUN receipt대로만 원복하고 W0 대조, 원복 재실행은 변경 0, receipt 없는 RUN·다른 RUN은 같은 rule·경로가 있어도 지우지 않음, firewalld reload 뒤 경로만 남은 상태·경로 추가 실패 뒤 rule만 남은 상태·DONE 없는 INTENT(세션 중단)를 각각 정리, 창 도중 다른 runtime 변경이 있으면 자기 것만 정리하고 멈춤
 - W0 조회 실패(권욱 B2): psql 실패·`hba_file` 불일치·NM 조회 실패·NM 영구 경로 존재면 pre-apply가 변경 0으로 멈춤, `check`는 rc0이어도 `W0_READY=NO`
-- NM 3값 판정(권욱 B4): 조회 실패를 "없음"으로 보지 않음 — a2-apply 변경 0, a2-rollback은 runtime만 정리하고 OK를 내지 않음
+- W0 조회 실패 추가(권욱 CR 5485983590): `pg_hba_file_rules` 오류 1(매칭 줄 없음)이면 pre-apply 변경 0
+- A2 receipt(권욱 B3): receipt 없는 RUN·다른 RUN은 지우지 않음, 경로 추가 실패로 NM만 들어간 부분 적용은 NM만 원복
+- NM 3값 판정(권욱 B4): 조회 실패를 "없음"으로 보지 않음 — a2-apply 변경 0, a2-rollback은 다른 항목만 정리하고 OK를 내지 않으며 NM 경로는 남음
 - pg_hba 매칭 허용 줄 검사: `0.0.0.0/0`·`10.0.0.0/8`·`samenet` 줄이 있으면 pre-apply·a2-apply가 변경 0으로 멈추거나 `check`가 목록으로 보고, reject 줄은 제외
 - a2-rollback SHA 가드: a2-apply 뒤 pg_hba가 바뀌었으면 덮어쓰지 않고 변경 0으로 멈춤, 이미 원복됐으면 복원 건너뜀
 - 이미 있는 rule·경로·NM 경로, runtime·permanent 불일치, 같은 RUN 재적용이면 변경 0으로 멈춤

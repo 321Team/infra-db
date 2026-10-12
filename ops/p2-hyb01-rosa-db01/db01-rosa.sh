@@ -10,7 +10,8 @@
 #                  지우지 않는다. 재부팅은 정리 수단이 아니다. 2시간 상한은 자동 만료가 아니다(infra-db#12 권욱 B1·B3)
 #   a2-apply     : #47 A2 정식 반영(10/21 창). 복귀 경로(runtime + NM 영구) → rich rule(permanent + reload)
 #                  → pg_hba 1줄(`hostssl fdsdb fds_app 10.20.10.0/24 scram-sha-256`, 기존 fds_app hostssl 줄 바로 뒤) + reload
-#   a2-rollback  : a2-apply 원복(pg_hba 사본 복원 → rich rule 제거 + reload → 경로 삭제). 부분 적용 상태에서도 실행한다
+#   a2-rollback  : a2-apply 원복(pg_hba 사본 복원 → rich rule 제거 + reload → 경로 삭제). 같은 RUN의 A2 receipt
+#                  (~/p2-hyb01-rosa-<RUN>/a2.receipt)에 INTENT가 있는 변경만 되돌린다. 부분 적용 상태에서도 실행한다
 #   render-hba <in> <out> : 서버 없이 pg_hba 삽입 결과만 만든다(시험·리뷰용, RUN 불필요)
 # 출력 기록은 ~/p2-hyb01-rosa-<RUN>/, pg_hba 사본은 postgres 소유 /var/lib/pgsql/fds-evidence/p2-hyb01-rosa-<RUN>/(700/600).
 # set -e는 쓰지 않는다. 단계마다 결과를 보고 멈춘다. 이 스크립트 병합은 실행 GO가 아니다.
@@ -63,6 +64,8 @@ mkdir -p "$LOGDIR" && chmod 700 "$LOGDIR" || { echo "STOP: $LOGDIR 생성 실패
 LOG=$LOGDIR/db01-$MODE-$(date +%H%M%S).log
 # 사전 창 RUN receipt: W0 기준선 1줄 + 단계별 INTENT/DONE. 원복은 여기 적힌 변경만 한다(B3).
 RCPT=$LOGDIR/pre.receipt
+# A2 RUN receipt: 같은 형식. a2-rollback도 이 RUN이 a2-apply로 넣은 변경만 되돌린다(B3 A2).
+A2R=$LOGDIR/a2.receipt
 exec > >(tee -a "$LOG") 2>&1
 
 die() { echo "STOP: $*"; exit 3; }
@@ -260,6 +263,7 @@ case "$MODE" in
 
   a2-apply)
     sudo -v || die "sudo 인증 실패"
+    test -e "$A2R" && die "이 RUN의 A2 receipt가 이미 있음($A2R). 같은 RUN으로 재적용하지 않는다"
     env_record
     show
     echo "-- pg_hba_file_rules(전)"; hba_rules | tee "$LOGDIR/hba-rules.before" || die "pg_hba_file_rules 조회 실패. 변경하지 않았다"
@@ -289,21 +293,33 @@ case "$MODE" in
     test "$(printf '%s\n' "$HDIFF" | grep -c '^[<>]')" = 1 && test "$(printf '%s\n' "$HDIFF" | grep -cxF "> $HBA_LINE")" = 1 \
       || die "후보가 1줄 추가가 아님. 변경하지 않았다"
     IF_BEFORE=$(rt_ifaces)
+    W0_RULES=$(fw_rules_sha) && test -n "$W0_RULES" || die "runtime rich rule 목록 조회 실패. 변경하지 않았다"
+    # W0 기준선. 이 줄을 못 쓰면 원복 근거가 없으므로 서버 변경 전에 멈춘다.
+    echo "W0 $(date +%s) $(date '+%F %T') rule_rt=absent rule_perm=absent route=absent nm=absent hba_rows=0 match=YES rules_sha=$W0_RULES conn=$CONN" > "$A2R" \
+      || die "A2 receipt 기록 실패. 변경하지 않았다"
 
     # 1) 복귀 경로: NM 영구 설정(재부팅 대비) + runtime. connection을 다시 올리지 않는다(기존 연결 끊김 방지).
     nm_routes "$CONN" > "$LOGDIR/nm-routes.before"
-    sudo nmcli connection modify "$CONN" +ipv4.routes "$TUN $GW" || die "NM 영구 경로 추가 실패 → a2-rollback"
-    nm_has "$CONN" || die "NM 영구 경로 readback 실패 → a2-rollback"
-    sudo ip route add "$TUN" via "$GW" || die "runtime 경로 추가 실패 → a2-rollback"
-    via_gw || die "$PROBE 경로가 $GW를 지나지 않음 → a2-rollback"
+    echo "INTENT nm" >> "$A2R" || die "A2 receipt 기록 실패. 변경하지 않았다"
+    sudo nmcli connection modify "$CONN" +ipv4.routes "$TUN $GW" || die "NM 영구 경로 추가 실패 → a2-rollback $RUN"
+    echo "DONE nm" >> "$A2R"
+    nm_has "$CONN" || die "NM 영구 경로 readback 실패 → a2-rollback $RUN"
+    echo "INTENT route" >> "$A2R" || die "A2 receipt 기록 실패 → a2-rollback $RUN"
+    sudo ip route add "$TUN" via "$GW" || die "runtime 경로 추가 실패 → a2-rollback $RUN"
+    echo "DONE route" >> "$A2R"
+    via_gw || die "$PROBE 경로가 $GW를 지나지 않음 → a2-rollback $RUN"
     # 2) 방화벽: permanent + reload(runtime 전용 규칙이 없음을 위에서 확인했다)
-    sudo firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$RULE" || die "permanent rule 추가 실패 → a2-rollback"
-    sudo firewall-cmd --reload || die "firewalld reload 실패 → a2-rollback"
+    echo "INTENT rule" >> "$A2R" || die "A2 receipt 기록 실패 → a2-rollback $RUN"
+    sudo firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$RULE" || die "permanent rule 추가 실패 → a2-rollback $RUN"
+    sudo firewall-cmd --reload || die "firewalld reload 실패 → a2-rollback $RUN"
+    echo "DONE rule" >> "$A2R"
     test "$(rt_ifaces)" = "$IF_BEFORE" || die "reload 뒤 runtime 인터페이스 바인딩이 바뀜 → a2-rollback 판단"
     test "$(fw_state)" = present && test "$(fw_state --permanent)" = present || die "rule readback 불일치 → a2-rollback"
     test "$(fw_match)" = YES || die "reload 뒤 MATCH가 YES가 아님 → a2-rollback"
     # 3) pg_hba: cat > 로 덮어써 inode·권한·소유자·SELinux 문맥을 유지한다(db01.sh와 같은 방식).
-    sudo -u postgres sh -c 'cat "$1" > "$2"' sh "$SEC/pg_hba.conf.after" "$HBA" || die "pg_hba.conf 쓰기 실패 → a2-rollback"
+    echo "INTENT hba" >> "$A2R" || die "A2 receipt 기록 실패 → a2-rollback $RUN"
+    sudo -u postgres sh -c 'cat "$1" > "$2"' sh "$SEC/pg_hba.conf.after" "$HBA" || die "pg_hba.conf 쓰기 실패 → a2-rollback $RUN"
+    echo "DONE hba" >> "$A2R"
     reload_pg
     echo "-- pg_hba_file_rules(후)"; hba_rules | tee "$LOGDIR/hba-rules.after" || die "pg_hba_file_rules 조회 실패 → a2-rollback"
     test "$(hba_errors)" = 0 || die "reload 뒤 pg_hba_file_rules 오류 → a2-rollback"
@@ -322,8 +338,14 @@ case "$MODE" in
   a2-rollback)
     sudo -v || die "sudo 인증 실패"
     show
-    # 역순. 각 단계는 해당 변경이 있을 때만 되돌리고, 마지막 readback으로 판정한다.
-    if sudo -u postgres test -f "$SEC/pg_hba.conf.before"; then
+    # 역순. 이 RUN의 A2 receipt에 INTENT가 있는 변경만, 현재 그 변경이 있을 때만 되돌린다(B3).
+    # receipt가 없으면 아무것도 지우지 않는다. 조회 실패는 계속 정리하되 완료 판정을 막는다(B4).
+    test -f "$A2R" && grep -q '^W0 ' "$A2R" \
+      || die "이 RUN($RUN)의 a2-apply receipt가 없음 — 이 RUN이 넣은 변경이 아니므로 지우지 않았다. 수동 판단"
+    W0_RULES=$(sed -n 's/^W0 .* rules_sha=\([0-9a-f]*\).*/\1/p' "$A2R")
+    owned() { grep -qx "INTENT $1" "$A2R"; }
+    FOREIGN=""; QERR=""
+    if owned hba && sudo -u postgres test -f "$SEC/pg_hba.conf.before"; then
       # 현재 파일이 a2-apply 결과(after)와 같을 때만 사본으로 되돌린다. 그 사이 다른 승인된 pg_hba 변경이
       # 있었으면 덮어쓰지 않고 멈춘다(infra-db#12 하영 리뷰 비차단 1). 이미 before와 같으면 복원은 건너뛴다.
       # 이 단계에서 멈추면 방화벽·경로는 아직 바꾸지 않은 상태다.
@@ -339,23 +361,55 @@ case "$MODE" in
       else
         die "현재 pg_hba가 a2-apply 결과(after)·이전(before) 어느 쪽과도 다름 — 다른 변경이 있었을 수 있어 덮어쓰지 않는다. 수동 판단(방화벽·경로는 아직 그대로)"
       fi
+    elif owned hba; then
+      die "pg_hba INTENT는 있는데 사본이 없음 — 덮어쓰지 않는다. 수동 판단(방화벽·경로는 아직 그대로)"
     else
-      echo "-- pg_hba 사본 없음: pg_hba는 바꾸지 않았던 것으로 본다(대상 줄 수 $(sudo grep -cE "$HBA_RE" "$HBA"))"
+      echo "-- 이 RUN은 pg_hba를 바꾸지 않았음(INTENT hba 없음) — 건너뜀(대상 줄 수 $(sudo grep -cE "$HBA_RE" "$HBA"))"
     fi
-    if test "$(fw_state --permanent)" != absent; then
-      sudo firewall-cmd --permanent --zone="$ZONE" --remove-rich-rule="$RULE" || true
-      sudo firewall-cmd --reload || die "firewalld reload 실패"
+    # 방화벽 rule(permanent + runtime)
+    ST=$(fw_state --permanent)
+    if owned rule; then
+      case "$ST" in
+        present) sudo firewall-cmd --permanent --zone="$ZONE" --remove-rich-rule="$RULE" || QERR="$QERR permanent-rule-remove"
+                 sudo firewall-cmd --reload || die "firewalld reload 실패" ;;
+        absent) ;;
+        *) QERR="$QERR permanent-rule-query" ;;
+      esac
+      case "$(fw_state)" in
+        present) sudo firewall-cmd --zone="$ZONE" --remove-rich-rule="$RULE" || QERR="$QERR runtime-rule-remove" ;;
+        absent) ;;
+        *) QERR="$QERR runtime-rule-query" ;;
+      esac
+    else
+      test "$ST" = absent && test "$(fw_state)" = absent || FOREIGN="$FOREIGN rule"
     fi
-    test "$(fw_state)" = absent || sudo firewall-cmd --zone="$ZONE" --remove-rich-rule="$RULE" || true
+    # NM 영구 경로. 조회 실패(2)를 "없음"으로 보지 않는다(B4).
     CONN=$(nm_conn) || CONN=""
-    # NM 조회 실패(2)를 "없음"으로 보지 않는다. 지울 수 있는 runtime 경로는 계속 정리하고, 판정에서 멈춘다(B4).
-    case "$(nm_state "$CONN")" in
-      present) sudo nmcli connection modify "$CONN" -ipv4.routes "$TUN $GW" || echo "-- NM 경로 삭제 실패(수동 확인)" ;;
-      absent) ;;
-      *) echo "-- NM 영구 경로 확인 불가(connection=[$CONN]) — runtime 경로만 정리하고 판정에서 멈춘다" ;;
-    esac
-    test "$(route_state)" = absent || sudo ip route del "$TUN" via "$GW"
+    ST=$(nm_state "$CONN")
+    if owned nm; then
+      case "$ST" in
+        present) sudo nmcli connection modify "$CONN" -ipv4.routes "$TUN $GW" || QERR="$QERR nm-remove" ;;
+        absent) ;;
+        *) echo "-- NM 영구 경로 확인 불가(connection=[$CONN]) — 다른 항목만 정리하고 판정에서 멈춘다"; QERR="$QERR nm-query" ;;
+      esac
+    else
+      test "$ST" = absent || FOREIGN="$FOREIGN nm($ST)"
+    fi
+    # runtime 경로: via $GW인 정확한 경로만
+    ST=$(route_state)
+    if owned route; then
+      case "$ST" in
+        absent) ;;
+        "present ["*" via $GW "*) sudo ip route del "$TUN" via "$GW" || QERR="$QERR route-remove" ;;
+        present*) FOREIGN="$FOREIGN route($ST)" ;;
+        *) QERR="$QERR route-query" ;;
+      esac
+    else
+      test "$ST" = absent || FOREIGN="$FOREIGN route($ST)"
+    fi
     show
+    test -z "$FOREIGN" || die "이 RUN이 넣지 않은 항목이 있어 지우지 않았다:$FOREIGN — 이 RUN 소유분만 정리함. 수동 판단"
+    test -z "$QERR" || die "원복 중 조회·삭제 실패:$QERR — 원복 완료 판정 금지"
     test "$(hba_new_rows)" = 0 && test "$(hba_errors)" = 0 || die "원복 뒤 pg_hba에 $SRC 규칙이나 오류가 남음"
     test "$(fw_state)" = absent && test "$(fw_state --permanent)" = absent || die "원복 뒤 rich rule이 남음"
     test "$(route_state)" = absent || die "원복 뒤 runtime 경로가 남음"
@@ -366,7 +420,10 @@ case "$MODE" in
       *) die "NM 영구 경로 조회 실패: 원복 완료 판정 금지" ;;
     esac
     test "$(fw_match)" = YES || die "원복 뒤 MATCH가 YES가 아님 — W0 기록과 대조"
-    echo "RESULT a2-rollback=OK $(date '+%T')"
+    NOW_RULES=$(fw_rules_sha) || die "runtime rich rule 목록 조회 실패 — 원복 완료 판정 금지"
+    test -n "$W0_RULES" && test "$NOW_RULES" = "$W0_RULES" || die "runtime rich rule 목록이 W0와 다름 — 수동 대조"
+    echo "DONE rollback $(date +%s) $(date '+%F %T')" >> "$A2R"
+    echo "RESULT a2-rollback=OK $(date '+%T') — W0 대조 일치"
     ;;
 
   *)
