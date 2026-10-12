@@ -23,6 +23,7 @@ d=$FAKE_DIR; f=$d/rt
 for a in "$@"; do test "$a" = --permanent && f=$d/perm; done
 for a in "$@"; do
   case "$a" in
+    --list-rich-rules) cat "$f"; exit 0 ;;
     --query-rich-rule=*) grep -qxF "${a#*=}" "$f" && { echo yes; exit 0; } || { echo no; exit 1; } ;;
     --add-rich-rule=*) echo "add $(basename "$f")" >> "$d/mut"; echo "${a#*=}" >> "$f"; exit 0 ;;
     --remove-rich-rule=*) echo "remove $(basename "$f")" >> "$d/mut"; grep -vxF "${a#*=}" "$f" > "$f.n"; mv "$f.n" "$f"; exit 0 ;;
@@ -43,7 +44,7 @@ case "$args" in
   *"route show exact 10.20.0.0/16"*) test -f "$d/route" && echo "10.20.0.0/16 via 10.1.93.51 dev ens160"; exit 0 ;;
   *"route get 10.1.93.51"*) echo "10.1.93.51 dev ens160 src 10.1.93.55 uid 1000"; exit 0 ;;
   *"route get 10.20."*) if test -f "$d/route"; then echo "10.20.10.10 via 10.1.93.51 dev ens160 src 10.1.93.55 uid 1000"; else echo "10.20.10.10 via 10.1.93.1 dev ens160 src 10.1.93.55 uid 1000"; fi; exit 0 ;;
-  *"route add 10.20.0.0/16 via 10.1.93.51"*) echo "route add" >> "$d/mut"; test -f "$d/route" && exit 2; touch "$d/route"; exit 0 ;;
+  *"route add 10.20.0.0/16 via 10.1.93.51"*) echo "route add" >> "$d/mut"; test -n "${FAKE_ROUTE_ADD_FAIL:-}" && exit 2; test -f "$d/route" && exit 2; touch "$d/route"; exit 0 ;;
   *"route del 10.20.0.0/16 via 10.1.93.51"*) echo "route del" >> "$d/mut"; rm -f "$d/route"; exit 0 ;;
 esac
 exit 0
@@ -53,7 +54,7 @@ cat > "$T/bin/nmcli" <<'X'
 d=$FAKE_DIR
 case "$*" in
   *"device show ens160"*) echo "ens160"; exit 0 ;;
-  *"connection show ens160"*) cat "$d/nm" 2>/dev/null; exit 0 ;;
+  *"connection show ens160"*) test -n "${FAKE_NM_FAIL:-}" && { echo "Error: NetworkManager is not running." >&2; exit 8; }; cat "$d/nm" 2>/dev/null; exit 0 ;;
   *"connection modify ens160 +ipv4.routes"*) echo "nm add" >> "$d/mut"; echo "10.20.0.0/16 10.1.93.51" > "$d/nm"; exit 0 ;;
   *"connection modify ens160 -ipv4.routes"*) echo "nm del" >> "$d/mut"; : > "$d/nm"; exit 0 ;;
 esac
@@ -77,8 +78,10 @@ broad() {
     ($5 ~ /^(all|samenet|samehost)$/ || ($5 == "0.0.0.0" && $6 == "0.0.0.0") || ($5 == "10.0.0.0") || ($5 == "10.20.0.0") || $5 ~ /^10\.20\.10\./) {
       print $1 " " $2 " " $3 " " $4 " " $5 " " $6 " " $7 }'
 }
+# FAKE_PG_FAIL: 모든 질의가 연결 오류로 실패(B2). FAKE_HBA_FILE: 서버 hba_file이 다른 경로.
+test -n "${FAKE_PG_FAIL:-}" && { echo 'psql: error: connection to server on socket failed' >&2; exit 2; }
 case "$*" in
-  *"SHOW hba_file"*) echo "$h" ;;
+  *"SHOW hba_file"*) echo "${FAKE_HBA_FILE:-$h}" ;;
   *"auth_method <> 'reject'"*) broad ;;
   *max_connections*) echo "max_connections=100 superuser_reserved=3 sessions=7 authentication_timeout=1min" ;;
   *"address = '10.20.10.0'"*) rules | grep -cF '|10.20.10.0|255.255.255.0|' ;;
@@ -112,7 +115,7 @@ run() {
   cp "$T/hba" "$d/root/var/lib/pgsql/data/pg_hba.conf"
   test -n "${EXTRA_HBA:-}" && echo "$EXTRA_HBA" >> "$d/root/var/lib/pgsql/data/pg_hba.conf"
   test -n "${KEEP_DIR:-}" && d=$KEEP_DIR
-  out=$(FAKE_DIR=$d FAKE_HBA=$d/root/var/lib/pgsql/data/pg_hba.conf DB01_ROSA_TEST_ROOT=$d/root HOME=$d/home     PATH="$T/bin:$PATH" bash "$S" "$2" 20261021T1000 2>&1); rc=$?
+  out=$(FAKE_DIR=$d FAKE_HBA=$d/root/var/lib/pgsql/data/pg_hba.conf DB01_ROSA_TEST_ROOT=$d/root HOME=$d/home     PATH="$T/bin:$PATH" bash "$S" "$2" "${RUNID:-20261021T1000}" 2>&1); rc=$?
   mut=$(test -f "$d/mut" && tr '\n' ',' < "$d/mut" | sed 's/,$//')
   if test "$rc" = "$3" && printf '%s\n' "$out" | grep -q -- "$4" && { test "$5" = - || test "$mut" = "$5"; }; then
     echo "PASS rc=$rc mut=[$mut] $1"
@@ -124,14 +127,60 @@ run() {
 }
 
 run "check: 변경 없음" check 0 'rich rule .*runtime=absent permanent=absent' ""
-run "pre-apply: runtime rule + 경로만" pre-apply 0 'RESULT pre-apply=OK' "add rt,route add"
-EXTRA_RT=$RULE ROUTE=1 run "pre-rollback: pre-apply 상태에서 원복" pre-rollback 0 'RESULT pre-rollback=OK' "remove rt,route del"
-run "pre-rollback: 원래 상태에서도 안전(변경 0)" pre-rollback 0 'RESULT pre-rollback=OK' ""
+run "check: 정상 상태면 W0_READY=YES" check 0 'W0_READY(pre-apply)=YES' ""
+run "pre-apply: runtime rule + 경로만, receipt 기록" pre-apply 0 'RESULT pre-apply=OK' "add rt,route add"
+P=$LAST_DIR; rm -f "$P/mut"
+grep -q '^W0 .*rules_sha=' "$P/home/p2-hyb01-rosa-20261021T1000/pre.receipt" && grep -qx 'DONE route' "$P/home/p2-hyb01-rosa-20261021T1000/pre.receipt" \
+  && echo "PASS pre-apply: receipt에 W0·INTENT/DONE" || { echo "FAIL pre-apply: receipt"; FAILS=$((FAILS + 1)); }
+KEEP_DIR=$P run "pre-apply: 같은 RUN 재적용 거부(receipt 있음)" pre-apply 3 'receipt가 이미 있음' ""
+KEEP_DIR=$P run "pre-rollback: 같은 RUN receipt대로 원복, W0 대조" pre-rollback 0 'RESULT pre-rollback=OK .* W0 대조 일치' "remove rt,route del"
+rm -f "$P/mut"
+KEEP_DIR=$P run "pre-rollback: 원복 뒤 재실행은 건너뛰기만(변경 0)" pre-rollback 0 'RESULT pre-rollback=OK' ""
+
+# B3 — receipt 없는 RUN, 다른 RUN, 이 RUN이 넣지 않은 항목은 지우지 않는다.
+EXTRA_RT=$RULE ROUTE=1 run "pre-rollback: receipt 없음 + 같은 rule·경로가 있음 → 지우지 않음" pre-rollback 3 'receipt가 없음' ""
+run "pre-apply(다른 RUN 시험 준비)" pre-apply 0 'RESULT pre-apply=OK' "add rt,route add"
+Q=$LAST_DIR; rm -f "$Q/mut"
+RUNID=20261021T1100 KEEP_DIR=$Q run "pre-rollback: 다른 RUN으로는 지우지 않음" pre-rollback 3 'receipt가 없음' ""
+test -f "$Q/route" && grep -qxF "$RULE" "$Q/rt" && echo "PASS pre-rollback 다른 RUN: rule·경로 그대로" || { echo "FAIL pre-rollback 다른 RUN: 지워짐"; FAILS=$((FAILS + 1)); }
+
+# B1 — firewalld reload는 runtime rule만 permanent로 되돌리고 경로는 남긴다. 원복은 둘을 각각 판정한다.
+run "pre-apply(reload 시험 준비)" pre-apply 0 'RESULT pre-apply=OK' "add rt,route add"
+R1=$LAST_DIR; rm -f "$R1/mut"
+cp "$R1/perm" "$R1/rt"   # 창 도중 firewall-cmd --reload
+test -f "$R1/route" && echo "PASS reload: 커널 경로는 남음(reload로 정리되지 않음)" || { echo "FAIL reload: 경로 사라짐"; FAILS=$((FAILS + 1)); }
+KEEP_DIR=$R1 run "pre-rollback: reload 뒤 — rule은 건너뛰고 경로만 삭제" pre-rollback 0 'RESULT pre-rollback=OK' "route del"
+# rule 추가 뒤 경로 추가 실패 → rule만 원복
+FAKE_ROUTE_ADD_FAIL=1 run "pre-apply: 경로 추가 실패 → STOP(rule만 추가된 상태)" pre-apply 3 '경로 추가 실패' "add rt,route add"
+R2=$LAST_DIR; rm -f "$R2/mut"
+KEEP_DIR=$R2 run "pre-rollback: 경로 추가 실패 뒤 rule만 원복" pre-rollback 0 'RESULT pre-rollback=OK' "remove rt"
+# 세션 중단: 경로를 넣은 뒤 DONE을 쓰기 전에 끊김 → INTENT로 소유를 판단해 정리
+run "pre-apply(중단 시험 준비)" pre-apply 0 'RESULT pre-apply=OK' "add rt,route add"
+R3=$LAST_DIR; rm -f "$R3/mut"
+sed -i '/^DONE route$/d' "$R3/home/p2-hyb01-rosa-20261021T1000/pre.receipt"
+KEEP_DIR=$R3 run "pre-rollback: DONE 없는 INTENT(세션 중단)도 이 RUN 소유로 정리" pre-rollback 0 'RESULT pre-rollback=OK' "remove rt,route del"
+# 창 도중 다른 runtime 변경 → 이 RUN 소유분만 정리하고 W0 대조에서 멈춤
+run "pre-apply(동시 변경 시험 준비)" pre-apply 0 'RESULT pre-apply=OK' "add rt,route add"
+R4=$LAST_DIR; rm -f "$R4/mut"
+echo 'rule family="ipv4" source address="10.9.9.9/32" accept' >> "$R4/rt"
+KEEP_DIR=$R4 run "pre-rollback: 다른 runtime 변경이 있으면 자기 것만 정리 후 STOP" pre-rollback 3 'STOP' "remove rt,route del"
+grep -qF '10.9.9.9/32' "$R4/rt" && echo "PASS pre-rollback 동시 변경: 다른 규칙 보존" || { echo "FAIL pre-rollback 동시 변경: 다른 규칙 삭제"; FAILS=$((FAILS + 1)); }
+
+# B2 — W0 필수 조회가 실패하면 첫 쓰기 전에 멈춘다.
+FAKE_PG_FAIL=1 run "pre-apply: psql 조회 실패 → 변경 0" pre-apply 3 'STOP' ""
+FAKE_HBA_FILE=/other/pg_hba.conf run "pre-apply: hba_file 불일치 → 변경 0" pre-apply 3 'hba_file' ""
+FAKE_NM_FAIL=1 run "pre-apply: NM 조회 실패 → 변경 0" pre-apply 3 'NM 영구 경로 조회 실패' ""
+NMROUTE=1 run "pre-apply: NM 영구 경로가 이미 있음 → 변경 0" pre-apply 3 'NM 영구 경로가 이미 있음' ""
+FAKE_PG_FAIL=1 run "check: 조회 실패면 rc0이어도 W0_READY=NO" check 0 'W0_READY(pre-apply)=NO' ""
 EXTRA_RT=$RULE run "pre-apply: runtime rule이 이미 있음 → 변경 0" pre-apply 3 'STOP' ""
 ROUTE=1 run "pre-apply: 경로가 이미 있음 → 변경 0" pre-apply 3 'STOP' ""
 EXTRA_RT='rule family="ipv4" source address="10.9.9.9/32" accept' run "pre-apply: runtime·permanent 불일치 → 변경 0" pre-apply 3 'MATCH가 YES가 아님' ""
 EXTRA_PERM=$RULE run "a2-apply: permanent rule이 이미 있음 → 변경 0" a2-apply 3 'STOP' ""
 NMROUTE=1 run "a2-apply: NM 영구 경로가 이미 있음 → 변경 0" a2-apply 3 'NM 영구 경로가 이미 있음' ""
+# B4 — NM 조회 실패(2)를 "없음"으로 보지 않는다.
+FAKE_NM_FAIL=1 run "a2-apply: NM 조회 실패 → 변경 0" a2-apply 3 'NM 영구 경로 조회 실패' ""
+FAKE_NM_FAIL=1 EXTRA_RT=$RULE EXTRA_PERM=$RULE ROUTE=1 NMROUTE=1 run "a2-rollback: NM 조회 실패면 runtime만 정리하고 OK를 내지 않음" a2-rollback 3 '원복 완료 판정 금지' "remove perm,reload,route del"
+test -s "$LAST_DIR/nm" && echo "PASS a2-rollback NM 조회 실패: NM 경로는 남아 있고 OK 아님" || { echo "FAIL a2-rollback NM 조회 실패"; FAILS=$((FAILS + 1)); }
 EXTRA_RT=$RULE EXTRA_PERM=$RULE ROUTE=1 NMROUTE=1 run "a2-rollback: 방화벽·경로 원복(pg_hba 사본 없음)" a2-rollback 0 'RESULT a2-rollback=OK' "remove perm,reload,nm del,route del"
 # a2-apply 정상 경로 → 같은 상태에서 a2-rollback
 run "a2-apply: NM·runtime 경로 → permanent rule·reload → pg_hba 1줄" a2-apply 0 'RESULT a2-apply=OK' "nm add,route add,add perm,reload"
